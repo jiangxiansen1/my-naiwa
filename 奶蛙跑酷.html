@@ -1,0 +1,2221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>奶蛙跑酷 · 作者：汤圆Vision</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{width:100%;height:100%;overflow:hidden;background:#241d2e;
+  font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  touch-action:none;-webkit-user-select:none;user-select:none}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+canvas{display:block;box-shadow:0 0 70px rgba(0,0,0,.5);border-radius:2px}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<script>
+"use strict";
+/* ==========================================================================
+ * 奶蛙跑酷 —— 纯 HTML5 Canvas + JavaScript 竖版跑酷（单文件 / 零依赖 / 双击即玩）
+ * 作者：汤圆Vision
+ *
+ * 故事：奶蛙（爸爸）下班回家瘫在沙发上玩手机，孩子哭了没听见、奶瓶也没洗，
+ *       豆姐（妈妈）当场暴走，于是全家总动员的追逐战开始了……
+ *
+ * 玩法：三条轨道自动前进。左右换道躲障碍，跳跃跨过矮障碍，滑铲钻过晾衣绳。
+ *       豆姐每隔几秒往某一条轨道扔东西——换道或滑铲能躲开；
+ *       她扔出来的「小孩」如果跳起来接住，可以拿到额外奖励分。
+ *       失误越多，豆姐追得越近、扔得越勤。
+ *
+ * 操作：键盘 ← → / A D 换道；↑ / W / 空格 跳；↓ / S 滑铲；R 重开
+ *       触屏：左右滑换道，上滑跳，下滑滑铲，点按开始 / 重开
+ *
+ * 代码结构：
+ *   0 通用工具      1 画布自适应     2 配置常量     3 输入系统    4 音效
+ *   5 角色绘制（奶蛙 / 豆姐 / 小孩 / 牛来 / 肥嘟嘟）
+ *   6 障碍物与道具绘制   7 背景与跑道   8 游戏逻辑   9 渲染   10 界面与主循环
+ * ========================================================================== */
+
+/* ============================== 0. 通用工具 ============================== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const rnd   = (a, b) => a + Math.random() * (b - a);
+const rndI  = (a, b) => Math.floor(rnd(a, b + 1));
+const pick  = a => a[(Math.random() * a.length) | 0];
+const chance = p => Math.random() < p;
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const easeIn  = t => t * t * t;
+// 角度抖动（用于卡通式的"颤动"描边）
+const wob = (t, amp) => Math.sin(t * 13.7) * amp;
+
+/* ============================ 1. 画布与自适应 ============================ */
+const cv  = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W = 360, H = 640, DPR = 1;      // 逻辑尺寸 / 设备像素比
+
+function resize() {
+  const maxW = window.innerWidth, maxH = window.innerHeight;
+  // 竖版：手机上铺满，宽屏桌面上裁成 9:16 左右的竖条并居中
+  const cssH = maxH;
+  const cssW = Math.min(maxW, Math.round(maxH * 0.60));
+  DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+  cv.style.width  = cssW + 'px';
+  cv.style.height = cssH + 'px';
+  cv.width  = Math.round(cssW * DPR);
+  cv.height = Math.round(cssH * DPR);
+  W = cssW; H = cssH;
+  buildGradients();
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+
+/* ============================== 2. 配置常量 ============================== */
+const CFG = {
+  // —— 透视（伪 3D）——
+  Z0: 400,            // 透视常数：决定远端路宽收敛到约 0.12W
+  Z_FAR: 1750,        // 生成距离（远处由小变大接近，不会突然冒出）
+  Z_DEAD: -190,       // 移除距离（已经飞过镜头）
+  HORIZON: 0.35,      // 消失点高度 vanishY = H * 0.35（屏幕中上方）
+  BASE_Y:  0.78,      // 玩家所在深度平面的屏幕高度
+  LANE_DX: 0.1875,    // 相邻轨道间距：使屏幕底边路宽恰为 0.85W
+  // —— 角色基准尺寸（占屏高比例，约 1/6 屏高）——
+  P_SIZE: 0.165,      // 奶蛙身高
+  D_SIZE: 0.190,      // 豆姐身高（成人在同等深度下略高一点）
+  // —— 运动 ——
+  V_START: 320, V_MAX: 980, V_ACCEL: 8.5,
+  GRAV: 14.5, JUMP_V: 5.0,          // 跳跃（单位：身位/秒）
+  SLIDE_T: 0.55, LANE_T: 0.10,      // 滑铲时长 / 换道插值时间
+  // —— 玩法 ——
+  THROW_MIN: 2.8, THROW_MAX: 8.5,   // 豆姐投掷间隔（起步宽松，随怒气缩短）
+  PAN_RATE: 0.05, BABY_RATE: 0.10,  // 平底锅 5% / 小孩 10%
+  INV_T: 5.0, DASH_T: 5.0,          // 无敌 / 冲刺时长
+};
+
+// 深度 z -> 投影：scale / 屏幕坐标
+/* 深度 z（世界单位，0=玩家平面）→ 透视缩放 scale。1=玩家大小，→0 收敛到消失点 */
+function pScale(z) { return CFG.Z0 / (CFG.Z0 + z); }
+function pY(sc) { return H * CFG.HORIZON + (H * CFG.BASE_Y - H * CFG.HORIZON) * sc; }
+function pX(laneF, sc) { return W * 0.5 + (laneF - 1) * W * CFG.LANE_DX * sc; }
+/* 该深度下的路面半宽：与 pY 同样正比于 scale ⇒ 跑道边线必然是过消失点的直线 */
+function roadHalf(sc) { return W * CFG.LANE_DX * 1.5 * sc; }
+/* 屏幕底边对应的 scale */
+function scaleAtBottom() { return (1 - CFG.HORIZON) / (CFG.BASE_Y - CFG.HORIZON); }
+
+/* ============================== 3. 输入系统 ============================== */
+// 统一抽象成 4 个动作：left / right / jump / slide，外加 tap（确认）
+const IN = { queue: [], tap: false };
+function act(a) { IN.queue.push(a); }
+
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left',
+  ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'jump', KeyW: 'jump', Space: 'jump',
+  ArrowDown: 'slide', KeyS: 'slide',
+};
+window.addEventListener('keydown', e => {
+  if (e.repeat && !KEYMAP[e.code]) return;
+  if (KEYMAP[e.code]) { act(KEYMAP[e.code]); e.preventDefault(); }
+  if (e.code === 'Space' || e.code === 'Enter') { IN.tap = true; e.preventDefault(); }
+  if (e.code === 'KeyR') { IN.queue.push('restart'); }
+  Audio.unlock();
+}, { passive: false });
+
+// 触屏：滑动方向判定 + 点按
+let tx = 0, ty = 0, tDown = false, tMoved = false;
+cv.addEventListener('touchstart', e => {
+  const t = e.changedTouches[0]; tx = t.clientX; ty = t.clientY;
+  tDown = true; tMoved = false; Audio.unlock(); e.preventDefault();
+}, { passive: false });
+cv.addEventListener('touchmove', e => {
+  if (!tDown) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - tx, dy = t.clientY - ty;
+  const TH = 26;                                  // 滑动判定阈值（px）
+  if (!tMoved && Math.max(Math.abs(dx), Math.abs(dy)) > TH) {
+    tMoved = true;
+    if (Math.abs(dx) > Math.abs(dy)) act(dx > 0 ? 'right' : 'left');
+    else act(dy > 0 ? 'slide' : 'jump');
+  }
+  e.preventDefault();
+}, { passive: false });
+cv.addEventListener('touchend', e => {
+  if (tDown && !tMoved) IN.tap = true;            // 没滑动 = 点按
+  tDown = false; e.preventDefault();
+}, { passive: false });
+// 桌面端也支持鼠标点击确认
+cv.addEventListener('mousedown', () => { IN.tap = true; Audio.unlock(); });
+
+/* ================================ 4. 音效 ================================ */
+// 用 WebAudio 现场合成，不加载任何音频文件
+const Audio = {
+  ac: null, on: true, clip: null,          // clip：之后接入外部笑声素材时填 AudioBuffer
+  unlock() {
+    if (this.ac) { if (this.ac.state === 'suspended') this.ac.resume(); return; }
+    try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { this.on = false; }
+  },
+  tone(f0, f1, dur, type, vol) {
+    if (!this.on || !this.ac) return;
+    const ac = this.ac, t = ac.currentTime;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(f0, t);
+    if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol == null ? 0.10 : vol, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol) {
+    if (!this.on || !this.ac) return;
+    const ac = this.ac, n = Math.floor(ac.sampleRate * dur);
+    const buf = ac.createBuffer(1, n, ac.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const s = ac.createBufferSource(), g = ac.createGain();
+    s.buffer = buf; g.gain.value = vol || 0.12; s.connect(g); g.connect(ac.destination); s.start();
+  },
+  jump()   { this.tone(420, 760, 0.16, 'square', 0.07); },
+  land()   { this.tone(180, 110, 0.09, 'triangle', 0.06); },
+  slide()  { this.noise(0.18, 0.06); },
+  swap()   { this.tone(620, 880, 0.07, 'sine', 0.05); },
+  hit()    { this.tone(240, 70, 0.26, 'sawtooth', 0.11); this.noise(0.16, 0.09); },
+  pick()   { this.tone(880, 1320, 0.11, 'sine', 0.08); this.tone(1320, 1760, 0.10, 'sine', 0.05); },
+  grab()   { for (let i = 0; i < 3; i++) setTimeout(() => this.tone(660 + i * 220, 0, 0.09, 'triangle', 0.07), i * 60); },
+  /* 奶蛙的嘲笑：四声"哈"，音高逐声下行 + 带通共振峰，听感像卡通坏笑。
+   * 如果之后拿到干净的笑声素材，把 LAUGH_CLIP（base64 音频）填上就会优先播真音源。 */
+  laugh() {
+    if (this.clip) { const src = this.ac.createBufferSource(); src.buffer = this.clip; src.connect(this.ac.destination); src.start(); return; }
+    if (!this.on || !this.ac) return;
+    const ac = this.ac, t0 = ac.currentTime;
+    for (let i = 0; i < 4; i++) {
+      const t = t0 + i * 0.15, f0 = 330 - i * 28;
+      const o = ac.createOscillator(), g = ac.createGain(), bp = ac.createBiquadFilter(), lpf = ac.createBiquadFilter();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(f0 * 1.28, t);
+      o.frequency.exponentialRampToValueAtTime(f0 * 0.78, t + 0.13);
+      bp.type = 'bandpass'; bp.frequency.value = 820 + i * 90; bp.Q.value = 0.9;
+      lpf.type = 'lowpass'; lpf.frequency.value = 2800;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.09, t + 0.018);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      o.connect(bp); bp.connect(lpf); lpf.connect(g); g.connect(ac.destination);
+      o.start(t); o.stop(t + 0.16);
+    }
+  },
+  smash()  { this.noise(0.22, 0.13); this.tone(160, 60, 0.2, 'square', 0.08); },
+  throwS() { this.tone(300, 620, 0.12, 'sine', 0.05); },
+  over()   { [520, 420, 320, 200].forEach((f, i) => setTimeout(() => this.tone(f, f * 0.7, 0.2, 'square', 0.09), i * 130)); },
+  start()  { [440, 560, 700, 880].forEach((f, i) => setTimeout(() => this.tone(f, 0, 0.1, 'triangle', 0.07), i * 80)); },
+};
+/* ========================= 5. 基础绘图工具 & 角色 ========================= */
+/* ---- 调色板：温暖明亮的奶系配色 ---- */
+const C = {
+  naiwa: '#FFD93D', naiwaEdge: '#E9B32E', belly: '#F5E6C8', limb: '#6B5B4E', limbD: '#54473C',
+  eyeRing: '#BEE3A6', pupil: '#241C18',
+  skin: '#FFDBAC', skinSh: '#F2C3AE', hair: '#5D4037', hairL: '#7A5236',
+  shirt: '#1F1F24', shirtL: '#34343C', pants: '#2C3038', pantsL: '#3E434E', shoe: '#141417',
+  baby: '#FFD93D', babyBelly: '#F7E8CB', diaper: '#FFFFFF', diaperSh: '#E4E6EC',
+  cow: '#FFCC33', cowD: '#E5A91A', cowPink: '#FFB6C1', cowPinkD: '#E08FA0', horn: '#888888', hornD: '#6A6A6A',
+  roo: '#FFCC33', rooD: '#E5A91A', rooBelly: '#FFF3CD', rooNose: '#8B4513',
+  white: '#FFFFFF', ink: '#4A3A30',
+  /* 3D 柔体着色：全程不用描边，靠渐变做体积 */
+  nTop: '#FFF3AE', nMid: '#FFDC48', nBot: '#F8C64C', nDeep: '#EDAE45',
+  bellyHi: '#F7EBD8', bellyLo: '#E4CFB0',
+  limbTop: '#D9A93E', limbMid: '#8C7A5F', limbLo: '#665749', limbDeep: '#544739',
+  iris: '#54B96A', irisLo: '#2F8A48',
+  skinHi: '#FFEEE4', skinMid: '#FBD9C6', skinLo: '#EEBB9E',
+  hairHi: '#7A5232', hairMid: '#57351F', hairLo: '#3B2214',
+  clothHi: '#33333C', clothMid: '#1C1C22', clothLo: '#0D0D11',
+  pantHi: '#3A404C', pantMid: '#262B35', pantLo: '#171B22',
+};
+
+/* ---- 形状助手（全部基于圆 / 椭圆 / 矩形 / 贝塞尔，不用任何图片） ---- */
+function ell(x, y, rx, ry, rot) { ctx.beginPath(); ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), rot || 0, 0, TAU); }
+function fE(x, y, rx, ry, c, rot) { ell(x, y, rx, ry, rot); ctx.fillStyle = c; ctx.fill(); }
+function sE(x, y, rx, ry, c, lw, rot) { ell(x, y, rx, ry, rot); ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.stroke(); }
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+}
+function fRR(x, y, w, h, r, c) { rrPath(x, y, w, h, r); ctx.fillStyle = c; ctx.fill(); }
+function cap(x1, y1, x2, y2, wd, c) { ctx.strokeStyle = c; ctx.lineWidth = wd; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
+function line(pts, c, lw, close) {
+  ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (close) ctx.closePath();
+  ctx.stroke();
+}
+function fPoly(pts, c) { ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]); ctx.closePath(); ctx.fillStyle = c; ctx.fill(); }
+function star(cx, cy, r1, r2, n, rot, c) {
+  ctx.beginPath();
+  for (let i = 0; i < n * 2; i++) {
+    const a = (rot || 0) + i * Math.PI / n, r = i % 2 ? r2 : r1;
+    ctx[i ? 'lineTo' : 'moveTo'](cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+  }
+  ctx.closePath(); ctx.fillStyle = c; ctx.fill();
+}
+function arc(x, y, r, a0, a1, c, lw) { ctx.beginPath(); ctx.arc(x, y, r, a0, a1); ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.stroke(); }
+function qcurve(x0, y0, cx, cy, x1, y1, c, lw) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.quadraticCurveTo(cx, cy, x1, y1); ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.stroke(); }
+// 毛茸茸边缘：沿轮廓撒一圈小圆
+function fluff(pts, r, c) { ctx.fillStyle = c; for (const p of pts) { fE(p[0], p[1], r, r, c); } }
+function fluffArc(cx, cy, rx, ry, a0, a1, n, r, c) {
+  ctx.fillStyle = c;
+  for (let i = 0; i <= n; i++) { const a = lerp(a0, a1, i / n); fE(cx + Math.cos(a) * rx, cy + Math.sin(a) * ry, r, r, c); }
+}
+
+/* 竖向体积渐变椭圆：顶部受光、底部偏橙 */
+function vE(x, y, rx, ry, c0, c1, c2, rot) {
+  const g = ctx.createLinearGradient(x, y - ry, x, y + ry);
+  g.addColorStop(0, c0); g.addColorStop(0.48, c1); g.addColorStop(1, c2);
+  ell(x, y, rx, ry, rot); ctx.fillStyle = g; ctx.fill();
+}
+/* 球体渐变椭圆：高光偏左上、边缘收暗（无描边） */
+function sE2(x, y, rx, ry, c0, c1, c2, rot) {
+  const g = ctx.createRadialGradient(x - rx * 0.3, y - ry * 0.42, Math.min(rx, ry) * 0.08, x, y, Math.max(rx, ry) * 1.18);
+  g.addColorStop(0, c0); g.addColorStop(0.45, c1); g.addColorStop(1, c2);
+  ell(x, y, rx, ry, rot); ctx.fillStyle = g; ctx.fill();
+}
+/* 羽化椭圆：中心实、边缘完全透明，用于肚皮斑块 */
+function feather(x, y, rx, ry, c0, c1, rot) {
+  const g = ctx.createRadialGradient(x, y, Math.min(rx, ry) * 0.12, x, y, Math.max(rx, ry));
+  g.addColorStop(0, c0); g.addColorStop(0.6, c1); g.addColorStop(1, 'rgba(240,225,200,0)');
+  ell(x, y, rx, ry, rot); ctx.fillStyle = g; ctx.fill();
+}
+/* 锥形四肢：由粗到细，带侧向明暗 */
+function limb(x0, y0, w0, x1, y1, w1, c0, c1, e0, e1) {
+  const a = Math.atan2(y1 - y0, x1 - x0) + Math.PI / 2, dx = Math.cos(a), dy = Math.sin(a);
+  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2, ww = (w0 + w1) * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(x0 - dx * w0, y0 - dy * w0);
+  ctx.quadraticCurveTo(mx - dx * ww, my - dy * ww, x1 - dx * w1, y1 - dy * w1);
+  ctx.lineTo(x1 + dx * w1, y1 + dy * w1);
+  ctx.quadraticCurveTo(mx + dx * ww, my + dy * ww, x0 + dx * w0, y0 + dy * w0);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(x0 - dx * w0, y0 - dy * w0, x0 + dx * w0, y0 + dy * w0);
+  g.addColorStop(0, c0); g.addColorStop(0.52, c1);
+  g.addColorStop(0.88, e0 || 'rgba(160,105,30,.30)');                 // 默认=奶蛙的暖色边缘
+  g.addColorStop(1, e1 || 'rgba(150,95,25,.42)');
+  ctx.fillStyle = g; ctx.fill();
+}
+/* 四肢末端：黄 → 灰的渐变（参考图正是这样过渡的） */
+function grayTip(x0, y0, x1, y1) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  g.addColorStop(0, C.limbTop); g.addColorStop(0.4, C.limbMid); g.addColorStop(0.75, C.limbLo); g.addColorStop(1, C.limbDeep);
+  return g;
+}
+
+function soft(cx, cy, rx, ry, base, rot, hi, lo) {
+  ell(cx, cy, rx, ry, rot); ctx.fillStyle = base; ctx.fill();
+  const g = ctx.createRadialGradient(cx - rx * 0.34, cy - ry * 0.46, 1, cx, cy, Math.max(rx, ry) * 1.3);
+  g.addColorStop(0, hi || 'rgba(255,255,255,.30)');
+  g.addColorStop(0.46, 'rgba(255,255,255,0)');
+  g.addColorStop(1, lo || 'rgba(150,92,22,.24)');
+  ctx.save(); ell(cx, cy, rx, ry, rot); ctx.clip(); ctx.fillStyle = g;
+  ctx.fillRect(cx - rx * 2.2, cy - ry * 2.2, rx * 4.4, ry * 4.4); ctx.restore();
+}
+/* 多个椭圆的并集路径（先 moveTo 再 ellipse，避免子路径之间连出直线） */
+function unionEll(list) {
+  ctx.beginPath();
+  for (const e of list) {
+    const rot = e[4] || 0;
+    ctx.moveTo(e[0] + Math.cos(rot) * e[2], e[1] + Math.sin(rot) * e[3]);
+    ctx.ellipse(e[0], e[1], e[2], e[3], rot, 0, TAU);
+  }
+}
+
+/* --------------------------- 奶蛙（主角 / 爸爸） ---------------------------
+ * 明黄色梨形胖身体，头身一体没有脖子，大肚子，头顶两侧凸出大眼（浅绿眼圈+黑瞳），
+ * 短粗三指手臂 + 两趾青蛙脚。设计身高 120，脚底在 y=0。
+ * o = { mode:'run'|'jump'|'slide'|'idle'|'sit'|'scared'|'fall'|'dizzy', ph:相位,
+ *       eyes:'normal'|'star'|'wide'|'shut'|'dead', mouth, tilt, hold }
+ */
+function drawNaiwaFront(o) {
+  o = o || {};
+  const mode = o.mode || 'run', ph = o.ph || 0, eyes = o.eyes || 'normal';
+  const s1 = Math.sin(ph);
+  let bob = 0, lean = 0;
+  if (mode === 'run') bob = -Math.abs(s1) * 3.2;
+  if (mode === 'scared') { bob = -Math.abs(s1) * 4.6; lean = 0.14; }
+  if (mode === 'jump') bob = -3;
+  if (mode === 'fall') lean = -0.5;
+  if (mode === 'dizzy') { lean = Math.sin(ph * 2) * 0.14; bob = Math.sin(ph * 3) * 2; }
+  if (mode === 'sit') bob = Math.sin(ph) * 1.2;
+  ctx.save();
+  if (lean) { ctx.translate(0, -50); ctx.rotate(lean); ctx.translate(0, 50); }
+
+  if (mode === 'slide') {                                            // 滑铲：压扁 + 双腿前伸
+    for (const sg of [-1, 1]) {
+      limb(sg * 8, -18, 8, sg * 33, -12 + (sg < 0 ? 5 : 0), 5.5, C.nMid, C.nBot);
+      ell(sg * 38, -10 + (sg < 0 ? 5 : 0), 11.5, 6.8, sg * 0.2); ctx.fillStyle = grayTip(sg * 28, -16, sg * 48, -3); ctx.fill();
+    }
+    ctx.save(); ctx.translate(0, -3); ctx.scale(1.14, 0.4); naiwaBlob(0); naiwaFace(0, -104, 1, eyes, o); ctx.restore();
+    limb(-24, -24, 7, -35, -11, 5, C.nMid, C.nBot);
+    ell(-37, -9, 7.6, 6.6); ctx.fillStyle = grayTip(-32, -17, -42, -1); ctx.fill();
+    ctx.restore(); return;
+  }
+
+  for (const side of [-1, 1]) {                                      // ---- 锥形长腿，末端灰脚掌 ----
+    const p = ph + (side > 0 ? Math.PI : 0);
+    let fx, fy;
+    if (mode === 'run' || mode === 'scared') { fx = side * 15 + Math.sin(p) * 13; fy = -2 - Math.max(0, Math.sin(p)) * 19; }
+    else if (mode === 'jump') { fx = side * 18; fy = -22; }
+    else if (mode === 'sit') { fx = side * 14 + 17; fy = -9; }
+    else if (mode === 'fall') { fx = side * 16 + Math.sin(p) * 8; fy = -13; }
+    else { fx = side * 15; fy = -3; }
+    const kx = (side * 12 + fx) / 2 + side * 2;
+    limb(side * 12, -20 + bob, 13.5, kx, -12 + bob, 9.5, C.nMid, C.nBot);
+    limb(kx, -12 + bob, 9.5, fx, fy + 3, 6.5, C.nBot, C.nDeep);
+    ell(fx, fy, 12.5, 7.6, side * -0.05); ctx.fillStyle = grayTip(fx - 10, fy - 6, fx + 10, fy + 6); ctx.fill();
+    ctx.save(); ctx.globalAlpha = 0.45; line([[fx - 1, fy - 5], [fx - 1, fy + 5]], '#4E4238', 1.3); ctx.restore();
+  }
+  naiwaBlob(bob);
+  for (const side of [-1, 1]) {                                      // ---- 长手臂，末端渐变灰手 ----
+    const p = ph + (side > 0 ? Math.PI : 0);
+    let hx, hy, shX = side * 29, shY = -78 + bob;
+    if (mode === 'run' || mode === 'dizzy') { hx = side * 35 + Math.sin(p + Math.PI) * 4; hy = -40 + bob + Math.cos(p) * 12; }
+    else if (mode === 'jump' || mode === 'scared' || mode === 'fall') { hx = side * 27; hy = -104 + bob; shX = side * 27; }
+    else if (mode === 'sit') { hx = side * 18; hy = -54 + bob; }
+    else { hx = side * 34; hy = -30 + bob; }
+    const ex = (shX + hx) / 2 + side * 4, ey = (shY + hy) / 2;
+    limb(shX, shY, 9, ex, ey, 7.4, C.nMid, C.nBot);
+    limb(ex, ey, 7.4, hx, hy, 5.8, C.nBot, C.nDeep);
+    ell(hx, hy + 2, 7.4, 8.6, side * 0.08); ctx.fillStyle = grayTip(hx, hy - 8, hx, hy + 11); ctx.fill();
+    for (let i = -1; i <= 1; i++) { ell(hx + i * 4, hy + 8.6, 2.2, 3, i * 0.16); ctx.fillStyle = '#5B4D42'; ctx.fill(); }
+  }
+  if (o.hold === 'phone') drawPhone(16, -52 + bob);
+  naiwaFace(0, -104 + bob, 1, o.hold ? 'shut' : eyes, o);
+  ctx.restore();
+}
+
+/* 奶蛙身体：先画大一圈形成统一描边，再叠大肚子与浅米肚皮 */
+function naiwaBlob(bob) {
+  const y0 = bob;
+  ctx.beginPath();
+  ctx.moveTo(0, -122 + y0);
+  ctx.bezierCurveTo(15, -122 + y0, 21, -113 + y0, 21.5, -101 + y0);
+  ctx.bezierCurveTo(21, -92 + y0, 30, -84 + y0, 37, -72 + y0);
+  ctx.bezierCurveTo(46, -60 + y0, 47, -44 + y0, 40, -34 + y0);
+  ctx.bezierCurveTo(34, -27 + y0, 21, -24 + y0, 0, -24 + y0);
+  ctx.bezierCurveTo(-21, -24 + y0, -34, -27 + y0, -40, -34 + y0);
+  ctx.bezierCurveTo(-47, -44 + y0, -46, -60 + y0, -37, -72 + y0);
+  ctx.bezierCurveTo(-30, -84 + y0, -21, -92 + y0, -20.5, -101 + y0);
+  ctx.bezierCurveTo(-21, -113 + y0, -15, -122 + y0, 0, -122 + y0);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(0, -121 + y0, 0, -24 + y0);
+  g.addColorStop(0, C.nTop); g.addColorStop(0.3, C.nMid); g.addColorStop(0.72, C.nBot); g.addColorStop(1, C.nDeep);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.save(); ctx.clip();
+  const hl = ctx.createRadialGradient(-11, -100 + y0, 2, -11, -100 + y0, 42);
+  hl.addColorStop(0, 'rgba(255,253,222,.6)'); hl.addColorStop(1, 'rgba(255,253,222,0)');
+  ctx.fillStyle = hl; ctx.fillRect(-50, -124 + y0, 100, 132);
+  const rim = ctx.createRadialGradient(17, -14 + y0, 2, 17, -14 + y0, 30);
+  rim.addColorStop(0, 'rgba(255,240,200,.3)'); rim.addColorStop(1, 'rgba(255,240,200,0)');
+  ctx.fillStyle = rim; ctx.fillRect(-50, -124 + y0, 100, 132);
+  feather(0, -40 + y0, 30.5, 29.5, C.bellyHi, C.bellyLo);                // 大肚皮：边缘完全羽化
+  ctx.save(); ctx.globalAlpha = 0.13; ell(0, -10 + y0, 26, 8); ctx.fillStyle = '#A87524'; ctx.fill(); ctx.restore();
+  ctx.restore();
+}
+
+/* 奶蛙的脸：头顶两侧凸出的大眼（浅绿眼圈 + 大黑瞳）+ 小而微扬的嘴 */
+function naiwaFace(hx, hy, k, eyes, o) {
+  const ey = hy - 4, ex = 10.5;                                      // 参考图：两眼靠近、位于头顶偏下
+  for (const side of [-1, 1]) {
+    const x = hx + side * ex * k, y = ey, r = (eyes === 'wide' ? 9.6 : 8.6) * k;
+    if (eyes === 'star') { star(x, y, 10 * k, 4 * k, 5, (o.ph || 0) * 1.6 * side, '#FFF3B0'); star(x, y, 5.4 * k, 2 * k, 5, -(o.ph || 0) * 2.4, '#FFFFFF'); continue; }
+    if (eyes === 'dead') { line([[x - 5.5 * k, y - 5.5 * k], [x + 5.5 * k, y + 5.5 * k]], C.ink, 3 * k); line([[x - 5.5 * k, y + 5.5 * k], [x + 5.5 * k, y - 5.5 * k]], C.ink, 3 * k); continue; }
+    if (eyes === 'shut') { arc(x, y + 1, 6.5 * k, Math.PI * 0.15, Math.PI * 0.85, '#5A4632', 2.6 * k); continue; }
+    sE2(x, y, r, r * 1.02, '#93E2A4', C.iris, C.irisLo);             // 绿虹膜：渐变，不描边
+    ell(x + side * r * 0.06, y + r * 0.04, r * 0.66, r * 0.69); ctx.fillStyle = '#141009'; ctx.fill();
+    fE(x - r * 0.26, y - r * 0.34, r * 0.2, r * 0.2, 'rgba(255,255,255,.92)');
+    ctx.save(); ctx.globalAlpha = 0.42; fE(x, y + r * 0.95, r * 0.78, r * 0.2, 'rgba(120,86,36,.6)'); ctx.restore();
+  }
+  const my = hy + 13 * k;                                            // 嘴：一条细线，微微上扬
+  if (eyes === 'wide') {
+    ell(hx, my + 3.5 * k, 5 * k, 6 * k); ctx.fillStyle = '#7A4038'; ctx.fill();
+    fE(hx, my + 6 * k, 3 * k, 2.2 * k, '#EE8A8A');
+  } else {
+    ctx.strokeStyle = 'rgba(88,60,38,.92)'; ctx.lineWidth = 1.9 * k; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(hx - 8.5 * k, my - 0.6 * k);
+    ctx.quadraticCurveTo(hx + 1 * k, my + 3.4 * k, hx + 9 * k, my + 0.2 * k); ctx.stroke();
+    ctx.save(); ctx.globalAlpha = 0.2; fE(hx + 1 * k, my + 4.8 * k, 6 * k, 1.6 * k, '#8A5A30'); ctx.restore();
+  }
+}
+
+/* 手机（开场瘫在沙发上用） */
+function drawPhone(x, y) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(-0.35);
+  fRR(-7, -11, 14, 22, 3.5, '#3A3A46'); fRR(-5.5, -8.5, 11, 17, 2, '#9FE8FF');
+  ctx.save(); ctx.globalAlpha = 0.6; fRR(-5.5, -8.5, 11, 6, 2, '#FFFFFF'); ctx.restore();
+  ctx.restore();
+}/* ------------------ 豆姐（追逐者 / 妈妈） 设计身高 214 ------------------
+ * 3D 卡通风女性：棕色齐耳波波头侧分、白皮肤大眼、黑短袖 T + 深色修身长裤 + 黑平底鞋
+ * o = { mode:'run'|'stand'|'throw'|'angry', ph, arm:0..1 投掷进度, hips:叉腰, held:手持物 }
+ */
+function drawDoubaoFront(o) {
+  o = o || {};
+  const mode = o.mode || 'run', ph = o.ph || 0;
+  const bob = mode === 'run' ? -Math.abs(Math.sin(ph)) * 4 : Math.sin(ph * 0.8) * 1.6;
+  ctx.save(); ctx.translate(0, bob);
+  for (const side of [-1, 1]) {                                      // ---- 细长腿：深色修身裤 ----
+    const p = ph + (side > 0 ? Math.PI : 0);
+    let fx = side * 9.5;
+    if (mode === 'run') fx = side * 9.5 + Math.sin(p) * 17;
+    const kx = (side * 9 + fx) / 2 + side * 1.5;
+    limb(side * 9, -98, 9.6, kx, -52, 7.4, C.pantHi, C.pantMid);
+    limb(kx, -54, 7.4, fx, -9, 5.6, C.pantMid, C.pantLo);
+    ell(fx + side * 2.5, -4, 11.5, 6.2, side * 0.05);                // 黑平底鞋
+    ctx.fillStyle = (function () { const g = ctx.createLinearGradient(0, -10, 0, 2); g.addColorStop(0, '#3A3A42'); g.addColorStop(1, '#0E0E12'); return g; })(); ctx.fill();
+    ctx.save(); ctx.globalAlpha = 0.4; fE(fx + side * 1, -7.5, 6, 1.8, '#8A8A96'); ctx.restore();
+  }
+  ctx.beginPath();                                                   // ---- 合身黑 T：肩-胸-收腰 ----
+  ctx.moveTo(-20.5, -149);
+  ctx.bezierCurveTo(-23, -132, -18.5, -112, -15, -95);
+  ctx.bezierCurveTo(-6, -89, 6, -89, 15, -95);
+  ctx.bezierCurveTo(18.5, -112, 23, -132, 20.5, -149);
+  ctx.bezierCurveTo(13, -156, -13, -156, -20.5, -149);
+  ctx.closePath();
+  const tg = ctx.createLinearGradient(0, -156, 0, -89);
+  tg.addColorStop(0, C.clothHi); tg.addColorStop(0.5, C.clothMid); tg.addColorStop(1, C.clothLo);
+  ctx.fillStyle = tg; ctx.fill();
+  ctx.save(); ctx.clip(); ctx.globalAlpha = 0.13;                    // 胸前柔光 + 侧腰暗部
+  fE(-8, -130, 9, 26, '#FFFFFF', -0.16);
+  ctx.globalAlpha = 0.5; fE(17, -120, 5, 30, '#000000'); ctx.restore();
+  ell(0, -152.5, 8.6, 4.6); ctx.fillStyle = '#0B0B0F'; ctx.fill();   // 圆领
+  ell(0, -153.6, 7.4, 3.4); ctx.fillStyle = C.skinLo; ctx.fill();
+  fE(0, -157, 7.6, 6.5, C.skinSh);                                   // 脖子
+  for (const side of [-1, 1]) {                                      // ---- 手臂 ----
+    const p = ph + (side > 0 ? Math.PI : 0);
+    let hx, hy, throwing = (mode === 'throw' && side > 0);
+    const shX = side * 20, shY = -147;
+    if (throwing) { const th = lerp(-0.7, 2.5, easeOut(clamp(o.arm == null ? 0 : o.arm, 0, 1))); hx = shX + side * 30 * Math.sin(th); hy = shY - 30 * Math.cos(th); }
+    else if (o.hips) { hx = side * 25; hy = -112; }
+    else if (mode === 'run') { hx = side * 23 + Math.sin(p) * 15; hy = -104 + Math.cos(p) * 12; }
+    else { hx = side * 24; hy = -100; }
+    const ex = (shX + hx) / 2 + side * 4, ey = (shY + hy) / 2 + 5;
+    limb(shX, shY, 9.6, ex, ey - 4, 7.4, C.clothHi, C.clothLo);      // 短袖
+    limb(ex, ey - 4, 6.6, hx, hy, 4.6, C.skinHi, C.skinLo);          // 小臂
+    sE2(hx, hy + 2, 5.4, 6.6, C.skinHi, C.skinMid, C.skinLo);        // 手
+    if (o.hips) { ell(hx - side * 3, hy + 1, 4.6, 4); ctx.fillStyle = C.skinMid; ctx.fill(); }
+  }
+  if (o.held) {                                                      // 手里举着要扔的东西
+    ctx.save(); ctx.translate(24, -104); ctx.scale(0.6, 0.6);
+    if (o.held === 'baby') { ctx.scale(0.5, 0.5); drawBaby({ mode: 'cry', ph: (o.ph || 0) * 3 }); }
+    else drawItem(o.held, o.ph || 0);
+    ctx.restore();
+  }
+  doubaoHead(o);
+  ctx.restore();
+}
+
+/* 豆姐的头部：波波头侧分 + 大眼睛 + 生气表情 */
+function doubaoHead(o) {
+  o = o || {};
+  const hy = -184, mad = o.face === 'mad' || o.mode === 'throw';
+  sE2(-25.5, hy + 4, 5, 7.5, C.skinHi, C.skinMid, C.skinLo);         // 耳朵
+  sE2(25.5, hy + 4, 5, 7.5, C.skinHi, C.skinMid, C.skinLo);
+  sE2(0, hy - 3, 30.5, 32.5, C.hairHi, C.hairMid, C.hairLo);         // 后侧发量（波波头轮廓）
+  ctx.beginPath();                                                   // 脸：上宽下窄的圆润下巴
+  ctx.moveTo(-24, hy - 9);
+  ctx.bezierCurveTo(-24.5, hy + 11, -13.5, hy + 29, 0, hy + 30);
+  ctx.bezierCurveTo(13.5, hy + 29, 24.5, hy + 11, 24, hy - 9);
+  ctx.bezierCurveTo(21, hy - 27, -21, hy - 27, -24, hy - 9);
+  ctx.closePath();
+  const sg = ctx.createRadialGradient(-6, hy - 8, 2, 0, hy + 4, 34);
+  sg.addColorStop(0, C.skinHi); sg.addColorStop(0.55, C.skinMid); sg.addColorStop(1, C.skinLo);
+  ctx.fillStyle = sg; ctx.fill();
+  ctx.save(); ctx.globalAlpha = 0.5; feather(-15, hy + 11, 6.5, 4, 'rgba(246,150,150,.75)', 'rgba(246,150,150,0)');
+  feather(15, hy + 11, 6.5, 4, 'rgba(246,150,150,.75)', 'rgba(246,150,150,0)'); ctx.restore();
+  sE2(-25, hy + 6, 8.5, 17.5, C.hairHi, C.hairMid, C.hairLo, -0.05); // 齐耳短发两侧（发尾内扣）
+  sE2(25, hy + 6, 8.5, 17.5, C.hairMid, C.hairMid, C.hairLo, 0.05);
+  ctx.beginPath();                                                   // 侧分刘海（分缝在画面右侧）
+  ctx.moveTo(7, hy - 30);
+  ctx.bezierCurveTo(-13, hy - 30, -25, hy - 16, -27, hy + 3);
+  ctx.bezierCurveTo(-21, hy - 11, -7, hy - 19, 6, hy - 20);
+  ctx.bezierCurveTo(18, hy - 21, 26, hy - 12, 28, hy + 1);
+  ctx.bezierCurveTo(29, hy - 17, 23, hy - 30, 7, hy - 30);
+  ctx.closePath();
+  const hg = ctx.createLinearGradient(0, hy - 30, 0, hy + 4);
+  hg.addColorStop(0, C.hairHi); hg.addColorStop(0.6, C.hairMid); hg.addColorStop(1, C.hairLo);
+  ctx.fillStyle = hg; ctx.fill();
+  ctx.save(); ctx.globalAlpha = 0.34;                                // 头发光泽带
+  fE(-9, hy - 22, 13, 4.6, '#D8AE80', -0.24); fE(15, hy - 19, 7, 3.4, '#D8AE80', 0.3); ctx.restore();
+  for (const side of [-1, 1]) {                                      // ---- 大眼睛 ----
+    const x = side * 11.5, y = hy + 2;
+    ctx.beginPath();
+    ctx.moveTo(x - 8.2, y);
+    ctx.bezierCurveTo(x - 7, y - 8, x + 7, y - 8, x + 8.2, y);
+    ctx.bezierCurveTo(x + 6.4, y + 7, x - 6.4, y + 7, x - 8.2, y);
+    ctx.closePath();
+    const eg = ctx.createLinearGradient(0, y - 8, 0, y + 7);
+    eg.addColorStop(0, '#EDE6E2'); eg.addColorStop(0.4, '#FFFFFF'); eg.addColorStop(1, '#FFFFFF');
+    ctx.fillStyle = eg; ctx.fill();
+    sE2(x + side * 0.6, y + 0.8, 5.6, 6.3, '#7A5236', '#3E2517', '#170D07');
+    ell(x + side * 0.6, y + 1.4, 2.6, 3); ctx.fillStyle = '#0A0503'; ctx.fill();
+    fE(x - 1.9, y - 2.6, 2, 2.1, 'rgba(255,255,255,.95)');
+    fE(x + 2.4, y + 2.8, 1.1, 1.2, 'rgba(255,255,255,.7)');
+    ctx.strokeStyle = '#241612'; ctx.lineWidth = 2.7; ctx.lineCap = 'round';   // 上睫毛线 + 眼尾上挑
+    ctx.beginPath(); ctx.moveTo(x - 8.4, y - 0.4);
+    ctx.quadraticCurveTo(x, y - 9, x + 8.4, y - 1.4);
+    ctx.lineTo(x + side * 10.6, y - (mad ? 5.5 : 4)); ctx.stroke();
+    ctx.lineWidth = 1.5; ctx.beginPath();                            // 下睫
+    ctx.moveTo(x - 5.6, y + 6.4); ctx.quadraticCurveTo(x, y + 8, x + 5.6, y + 6.2); ctx.stroke();
+    ctx.strokeStyle = '#3E2417'; ctx.lineWidth = 2.2; ctx.beginPath();          // 眉（生气时下压内倾）
+    ctx.moveTo(x - 7.6, y - 12 + (mad ? 3.6 : 0) + side * (mad ? -1.6 : 0));
+    ctx.quadraticCurveTo(x, y - 16.5 + (mad ? 3 : 0), x + 7.6, y - 13 + (mad ? 2.4 : 0) - side * (mad ? -1.4 : 0));
+    ctx.stroke();
+  }
+  ctx.save(); ctx.globalAlpha = 0.5; fE(0, hy + 12, 2.4, 1.9, 'rgba(198,138,112,.8)'); ctx.restore();   // 鼻
+  if (mad) {                                                         // 怒吼 / 咬牙
+    ell(0, hy + 20, 7.6, 6.2); ctx.fillStyle = '#7A2E30'; ctx.fill();
+    fE(0, hy + 24.5, 4.6, 2.8, '#E8707C');
+    ctx.save(); ctx.beginPath(); ell(0, hy + 20, 7.6, 6.2); ctx.clip();
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(-7.6, hy + 14.6, 15.2, 4.2);
+    ctx.strokeStyle = '#D6D6DC'; ctx.lineWidth = 0.9;
+    for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(i * 4, hy + 14.6); ctx.lineTo(i * 4, hy + 18.8); ctx.stroke(); }
+    ctx.restore();
+  } else if (o.face === 'talk') { sE2(0, hy + 20, 4.4, 5, '#8A3638', '#6E2A2C', '#5A2224'); }
+  else {                                                             // 唇：上唇线 + 饱满下唇
+    sE2(0, hy + 20.5, 6.4, 3.4, '#F2A0A6', '#E07A82', '#C4636B');
+    ctx.strokeStyle = 'rgba(178,96,102,.85)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(-6, hy + 19.4); ctx.quadraticCurveTo(0, hy + 17.4, 6, hy + 19.4); ctx.stroke();
+  }
+}
+
+/* 怒气符号（井字青筋）+ 火苗 */
+function angerMark(x, y, s, t) {                                      // s = 像素尺寸
+  ctx.save(); ctx.translate(x, y); ctx.rotate(Math.sin(t * 5) * 0.14);
+  ctx.strokeStyle = '#E8543F'; ctx.lineWidth = Math.max(1.6, s * 0.2); ctx.lineCap = 'round';
+  const r = s * 0.5, d = s * 0.13;
+  ctx.beginPath();
+  for (const q of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) { ctx.moveTo(q[0] * r, q[1] * r); ctx.lineTo(q[0] * d, q[1] * d); }
+  ctx.stroke(); ctx.restore();
+}
+function flamePuff(x, y, s, t) {                                      // s = 像素尺寸，火苗往上窜
+  for (let i = 0; i < 3; i++) {
+    const a = t * 3 + i * 2.1, k = (Math.sin(a) + 1) / 2;
+    ctx.save(); ctx.globalAlpha = 0.5 + k * 0.35;
+    fE(x + Math.cos(a * 0.7) * s * 0.5, y - s * (0.75 + i * 0.72 + k * 0.4),
+      s * (0.48 - i * 0.1), s * (0.66 - i * 0.13), i % 2 ? '#FFC93C' : '#FF7A5C');
+    ctx.restore();
+  }
+}/* --------------------- 小孩（奶蛙和豆姐的孩子） 身高 82 ---------------------
+ * 明黄色婴儿：头顶稀疏胎毛、绿色大眼、吐舌头、白色尿布、深灰色小手
+ * o = { mode:'fly'|'giggle'|'cry', ph }
+ */
+/* ========================= 背面视角（第三人称跟随镜头） =========================
+ * 跑酷过程中镜头在角色身后，两个主角都只能看到后背与后脑勺。
+ * 开场客厅、过场走廊、结算揪耳朵属于演出镜头，仍用正面画法。
+ */
+function drawNaiwa(o) { o = o || {}; return o.view === 'back' ? drawNaiwaBack(o) : drawNaiwaFront(o); }
+function drawDoubaoChar(o) { o = o || {}; return o.view === 'back' ? drawDoubaoBack(o) : drawDoubaoFront(o); }
+
+/* ---- 奶蛙（背面）：圆滚滚的黄色后背、两侧鼓出的眼球、短腿交替抬起露脚底板 ---- */
+function drawNaiwaBack(o) {
+  o = o || {};
+  const mode = o.mode || 'run', ph = o.ph || 0;
+  const laughing = mode === 'laugh';
+  const running = mode === 'run' || mode === 'scared' || mode === 'dizzy' || laughing;
+  const lm = laughing ? 1.75 : 1;                                      // 嘲笑时幅度放大
+  const bob = running ? -Math.abs(Math.sin(ph)) * 3.4 * lm : (mode === 'jump' ? -2 : 0);
+  const sway = running ? Math.sin(ph) * 1.5 * lm : 0;                  // 髋部左右轻摆
+  const sq = running ? 1 + Math.sin(ph * 2) * 0.035 * lm : 1;          // 挤压拉伸
+  let lean = mode === 'dizzy' ? Math.sin(ph * 2) * 0.12 : (laughing ? Math.sin(ph * 2) * 0.11 : 0);
+  ctx.save();
+  if (lean) { ctx.translate(0, -55); ctx.rotate(lean); ctx.translate(0, 55); }
+
+  if (mode === 'slide') {                                             // 滑铲：整体压扁，脚底板朝天
+    ctx.save(); ctx.translate(0, -3); ctx.scale(1.14, 0.42); backBlob(0); backHead(0, o, 0); ctx.restore();
+    for (const sg of [-1, 1]) {
+      ell(sg * 15, -28, 10.5, 8.4, sg * 0.4); ctx.fillStyle = C.limb; ctx.fill();
+      ctx.save(); ctx.globalAlpha = 0.6; fE(sg * 15, -29, 6.2, 4.4, '#93816F', sg * 0.4); ctx.restore();
+    }
+    ctx.restore(); return;
+  }
+
+  /* ---------- 腿：髋 → 膝 → 踝 两段式 ----------
+   * 支撑腿几乎伸直踩实地面；摆动腿屈膝后踢，脚底朝镜头抬起 */
+  for (const side of [-1, 1]) {
+    const p = ph + (side > 0 ? Math.PI : 0);
+    let lift = 0, footX = side * 13.5, footY = -2, spread = 0;
+    if (running) {
+      lift = Math.max(0, Math.sin(p));                                 // 0=踩地 1=抬到最高
+      footY = -2 - lift * 26;
+      footX = side * 14 + Math.sin(p) * 6.5;
+      spread = lift;
+    } else if (mode === 'jump') { lift = 1; footY = -30; footX = side * 16; spread = 0.7; }
+    else if (mode === 'fall') { lift = 0.45 + 0.45 * Math.sin(p); footY = -lift * 22; footX = side * 15; spread = 0.5; }
+    const hipX = side * 12, hipY = -28 + bob;
+    const kneeX = side * (13.5 + spread * 5), kneeY = -15 - spread * 6 + bob * 0.55;
+    limb(hipX, hipY, 12.5, kneeX, kneeY, 9, C.nMid, C.nBot);           // 大腿
+    limb(kneeX, kneeY, 9, footX, footY + 3, 6.4, C.nBot, C.nDeep);     // 小腿
+    ell(footX + side * 2, footY - 2, 11.2, 7.8 - lift * 2.2, side * 0.1);   // 灰脚掌
+    ctx.fillStyle = C.limb; ctx.fill();
+    if (lift > 0.3) { ctx.save(); ctx.globalAlpha = 0.35 + lift * 0.45;     // 抬起时看到脚底板
+      fE(footX + side * 2, footY - 3.4, 6.8, 4.6, '#93816F'); ctx.restore(); }
+    ctx.save(); ctx.globalAlpha = 0.45;
+    line([[footX + side * 5, footY - 8], [footX + side * 5, footY + 1]], C.limbD, 1.5); ctx.restore();
+  }
+
+  /* ---------- 身体 / 手臂 / 头，一起做起伏 + 挤压拉伸 ---------- */
+  ctx.save();
+  ctx.translate(sway, bob); ctx.scale(1 / sq, sq);
+  backBlob(0);
+  for (const side of [-1, 1]) {                                        // 短手：前后摆 = 上下位移 + 轻微缩短
+    const p = ph + (side > 0 ? 0 : Math.PI);
+    const sw2 = laughing ? Math.sin(p) * 1.6 : (running ? Math.sin(p) : 0);
+    let ax = side * 33, hy = -58, rot = -sw2 * 0.45, el = 1;
+    if (mode === 'jump' || mode === 'fall') { rot = -side * 2.45; hy = -62; ax = side * 27; }
+    else { hy += sw2 * 8; ax += sw2 * 2.5; el = 1 - Math.max(0, sw2) * 0.14; }
+    ctx.save(); ctx.translate(ax, hy); ctx.rotate(rot);
+    soft(0, 11 * el, 7.4, 15 * el, side > 0 ? C.naiwa : '#F4CB3D');
+    ell(side * 2, 26 * el, 6.8, 7.4); ctx.fillStyle = C.limb; ctx.fill();
+    ctx.restore();
+  }
+  backHead(0, o, running ? -Math.sin(ph - 0.7) * 1.3 : 0);             // 头部延迟半拍，跑起来更有弹性
+  ctx.restore();
+  ctx.restore();
+}
+function backBlob(bob) {
+  const y0 = bob;
+  ctx.beginPath();                                                   // 头-颈-肩-大肚 一条轮廓线画完，不留接缝
+  ctx.moveTo(0, -122 + y0);
+  ctx.bezierCurveTo(15, -122 + y0, 21, -113 + y0, 21.5, -101 + y0);
+  ctx.bezierCurveTo(21, -92 + y0, 30, -84 + y0, 37, -72 + y0);
+  ctx.bezierCurveTo(46, -60 + y0, 47, -44 + y0, 40, -34 + y0);
+  ctx.bezierCurveTo(34, -27 + y0, 21, -24 + y0, 0, -24 + y0);
+  ctx.bezierCurveTo(-21, -24 + y0, -34, -27 + y0, -40, -34 + y0);
+  ctx.bezierCurveTo(-47, -44 + y0, -46, -60 + y0, -37, -72 + y0);
+  ctx.bezierCurveTo(-30, -84 + y0, -21, -92 + y0, -20.5, -101 + y0);
+  ctx.bezierCurveTo(-21, -113 + y0, -15, -122 + y0, 0, -122 + y0);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(0, -121 + y0, 0, -24 + y0);
+  g.addColorStop(0, C.nTop); g.addColorStop(0.3, C.nMid); g.addColorStop(0.72, C.nBot); g.addColorStop(1, C.nDeep);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.save(); ctx.clip();
+  const hl = ctx.createRadialGradient(-11, -100 + y0, 2, -11, -100 + y0, 40);
+  hl.addColorStop(0, 'rgba(255,253,222,.62)'); hl.addColorStop(1, 'rgba(255,253,222,0)');
+  ctx.fillStyle = hl; ctx.fillRect(-50, -124 + y0, 100, 132);
+  ctx.save(); ctx.globalAlpha = 0.16;                                // 背后中线凹陷
+  const sp = ctx.createLinearGradient(-5, 0, 5, 0);
+  sp.addColorStop(0, 'rgba(190,130,40,0)'); sp.addColorStop(0.5, 'rgba(178,120,35,.9)'); sp.addColorStop(1, 'rgba(190,130,40,0)');
+  ctx.fillStyle = sp; ctx.fillRect(-5, -96 + y0, 10, 92); ctx.restore();
+  ctx.save(); ctx.globalAlpha = 0.5;                                 // 侧翻时只露一线浅米肚皮
+  feather(-35, -34 + y0, 7, 19, 'rgba(244,232,212,.9)', 'rgba(240,224,198,0)', 0.14);
+  feather(35, -34 + y0, 7, 19, 'rgba(244,232,212,.9)', 'rgba(240,224,198,0)', -0.14); ctx.restore();
+  ctx.save(); ctx.globalAlpha = 0.2; ell(0, -26 + y0, 24, 6); ctx.fillStyle = '#A87524'; ctx.fill(); ctx.restore();
+  ctx.restore();
+}
+function backHead(bob, o, lagX) {
+  const hy = -101 + bob, lx = lagX || 0;
+  for (const side of [-1, 1]) {                                        // 眼球在脸前上方，被后脑勺挡住内侧
+    const x = side * 14.5 + lx * 0.6, y = hy - 14, rx = 9.6, ry = 11.4;
+    ell(x, y, rx, ry, side * 0.2);                                     // 只露出外侧与上缘那一圈
+    const g = ctx.createRadialGradient(x - side * rx * 0.35, y - ry * 0.5, 1, x, y, ry * 1.55);
+    g.addColorStop(0, '#FFF3AC'); g.addColorStop(0.5, C.naiwa); g.addColorStop(1, '#E9A93A');
+    ctx.fillStyle = g; ctx.fill();
+    ctx.save(); ctx.globalAlpha = 0.42;                                // 露出的那一小截虹膜（在脸的方向）
+    ell(x + side * rx * 0.34, y - ry * 0.22, rx * 0.34, ry * 0.42, side * 0.2);
+    ctx.fillStyle = C.iris; ctx.fill(); ctx.restore();
+    ctx.save(); ctx.globalAlpha = 0.32;                                // 与后脑勺的交界阴影
+    ell(x - side * rx * 0.7, y + ry * 0.1, rx * 0.34, ry * 0.8, side * 0.2);
+    ctx.fillStyle = '#C08A24'; ctx.fill(); ctx.restore();
+  }
+  if (o.eyes === 'star') for (let i = 0; i < 3; i++) {
+    const a = (o.ph || 0) * 2.2 + i * TAU / 3;
+    star(Math.cos(a) * 26 + lx, hy - 26 + Math.sin(a) * 7, 6, 2.4, 5, a, '#FFE08A');
+  }
+}
+
+/* ---- 豆姐（背面）：棕色波波头后脑勺、黑 T 恤后背、深色长裤、手臂摆动 ---- */
+function drawDoubaoBack(o) {
+  o = o || {};
+  const mode = o.mode || 'run', ph = o.ph || 0;
+  const running = mode === 'run';
+  const pump = o.pump == null ? 1 : o.pump;                            // 怒气越高摆臂越猛
+  const s1 = Math.sin(ph);
+  const bob = running ? -Math.abs(s1) * 4.2 : Math.sin(ph * 0.8) * 1.5;
+  const sway = running ? s1 * 1.7 : 0;                                 // 髋部左右摆
+  const sq = running ? 1 + Math.sin(ph * 2) * 0.03 : 1;                // 挤压拉伸
+  ctx.save();
+
+  /* ---------- 腿：髋 → 膝 → 踝，支撑腿踩实、摆动腿屈膝后踢露鞋底 ---------- */
+  for (const side of [-1, 1]) {
+    const p = ph + (side > 0 ? Math.PI : 0);
+    const sw = running ? Math.sin(p) : 0;
+    const lift = running ? Math.max(0, sw) : 0;
+    const hipX = side * 11, hipY = -87 + bob;
+    const kneeX = side * (12 + lift * 3.5) - sway * 0.3;
+    const kneeY = -50 - lift * 7 + bob * 0.55;
+    const footX = side * 11 + (running ? sw * 5 : 0);
+    const footY = -lift * 32;
+    limb(hipX, hipY, 11.5, kneeX, kneeY, 8.6, C.pantHi, C.pantMid, 'rgba(22,24,30,.5)', 'rgba(8,9,12,.7)');
+    limb(kneeX, kneeY, 8.6, footX, footY - 6 + lift * 3, 6.6, C.pantMid, C.pantLo, 'rgba(22,24,30,.5)', 'rgba(8,9,12,.7)');
+    ell(footX + side * 1, footY - 3.4, 11, 6.2, side * 0.05);          // 黑平底鞋
+    const sg2 = ctx.createLinearGradient(0, footY - 10, 0, footY + 3);
+    sg2.addColorStop(0, '#3C3C44'); sg2.addColorStop(1, '#0E0E12');
+    ctx.fillStyle = sg2; ctx.fill();
+    if (lift > 0.45) { ctx.save(); ctx.globalAlpha = 0.28 + lift * 0.22;   // 抬起时看到鞋底
+      fE(footX + side * 1, footY - 2.4, 7, 3.2, '#4A4A54'); ctx.restore(); }
+  }
+
+  /* ---------- 上身：肩部随步频反向微转 + 起伏 + 挤压 ---------- */
+  ctx.save();
+  ctx.translate(sway, bob); ctx.scale(1 / sq, sq);
+  ctx.save();
+  ctx.translate(0, -154); ctx.rotate(-s1 * 0.05); ctx.translate(0, 154);   // 肩线反转
+  ctx.beginPath();
+  ctx.moveTo(-24, -154); ctx.lineTo(24, -154); ctx.lineTo(17, -86); ctx.lineTo(-17, -86);
+  ctx.closePath();
+  const tg = ctx.createLinearGradient(0, -158, 0, -84);
+  tg.addColorStop(0, '#2C2C2C'); tg.addColorStop(0.5, '#1A1A1A'); tg.addColorStop(1, '#101010');
+  ctx.fillStyle = tg; ctx.fill();
+  fE(0, -154, 24, 9, '#232323'); fE(0, -87, 17, 7, '#151515');
+  ctx.save(); ctx.globalAlpha = 0.10; fE(-9, -132, 8, 22, '#FFFFFF', -0.15); ctx.restore();
+  ctx.restore();
+  /* T 恤下摆随步频轻甩 */
+  ctx.save(); ctx.globalAlpha = 0.35;
+  qcurve(-16, -88 + Math.sin(ph * 2) * 1.2, 0, -84 + Math.sin(ph * 2) * 1.6, 16, -88 - Math.sin(ph * 2) * 1.2, '#3A3A42', 2.4);
+  ctx.restore();
+  ctx.save(); ctx.globalAlpha = 0.92; fE(0, -126, 7.2, 7.2, '#FFFFFF'); ctx.restore();   // 后背中央圆 logo
+  ctx.save(); ctx.globalAlpha = 0.35; sE(0, -126, 7.2, 7.2, '#C8C8C8', 1.2); ctx.restore();
+  fE(0, -157, 9, 7, C.skin);                                                                 // 脖子（肤色）
+
+  /* ---------- 手臂：肩 → 肘 → 腕 屈肘摆动，末端肤色手 ---------- */
+  for (const side of [-1, 1]) {
+    const p = ph + (side > 0 ? Math.PI : 0);
+    const sw = running ? Math.sin(p) : 0;
+    let rot = -sw * 0.95 * pump;
+    if (o.throwArm && side > 0) rot = -2.5;                             // 投掷：右臂高举
+    const shX = side * 25, shY = -149;
+    const ex2 = shX + Math.sin(rot) * -7 * side * 0 + (-Math.sin(rot)) * 6;
+    const elbX = shX + (-Math.sin(rot)) * 6 + side * 3;
+    const elbY = shY + Math.cos(rot) * 22;
+    const wrX = elbX + (-Math.sin(rot * 0.55)) * 8;
+    const wrY = elbY + Math.cos(rot * 0.55) * 20;
+    limb(shX, shY, 8.6, elbX, elbY, 7, side > 0 ? '#3A3A3E' : '#242428', '#101014', 'rgba(20,20,26,.45)', 'rgba(6,6,9,.7)');
+    limb(elbX, elbY, 7, wrX, wrY, 5.6, '#2C2C30', '#141418', 'rgba(20,20,26,.45)', 'rgba(6,6,9,.7)');
+    ell(wrX, wrY + 1, 6.4, 6.8); ctx.fillStyle = C.skin; ctx.fill();                        // 手
+    if (o.held && side > 0) {
+      ctx.save(); ctx.translate(wrX, wrY - 8); ctx.scale(0.6, 0.6);
+      if (o.held === 'baby') { ctx.scale(0.5, 0.5); drawBaby({ mode: 'cry', ph: ph * 3 }); }
+      else drawItem(o.held, ph);
+      ctx.restore();
+    }
+  }
+
+  /* ---------- 后脑勺：深棕圆 + 两侧发尾（随步频甩动，比身体慢半拍） ---------- */
+  const hairSw = -s1 * 0.055 - Math.sin(ph - 0.8) * 0.035;
+  ctx.save();
+  ctx.translate(hairSw * 26, -bob * 0.35);
+  soft(0, -185, 29, 29, C.hair, 0, 'rgba(255,224,186,.24)', 'rgba(22,10,4,.52)');
+  for (const side of [-1, 1]) {                                                              // 波波头两侧发尾
+    ctx.save(); ctx.translate(side * 21.5, -180); ctx.rotate(side * 0.10 + hairSw * side * 0.6);
+    const hg = ctx.createLinearGradient(-10, 0, 10, 0);
+    hg.addColorStop(0, '#7A5544'); hg.addColorStop(0.5, C.hair); hg.addColorStop(1, '#3A241A');
+    ell(0, 11, 9.5, 15.5); ctx.fillStyle = hg; ctx.fill();
+    ctx.restore();
+  }
+  ctx.save(); ell(0, -185, 29, 29); ctx.clip(); ctx.globalAlpha = 0.20;
+  ctx.strokeStyle = '#2A1509'; ctx.lineWidth = 2.2;
+  for (let i = -3; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(i * 8.5, -213);
+    ctx.bezierCurveTo(i * 11.5 + hairSw * 10, -188, i * 10 + hairSw * 6, -166, i * 8 + 1 + hairSw * 4, -156); ctx.stroke(); }
+  ctx.globalAlpha = 0.26;
+  const hg2 = ctx.createRadialGradient(-8, -201, 2, -8, -201, 20);
+  hg2.addColorStop(0, '#E7BE93'); hg2.addColorStop(1, 'rgba(231,190,147,0)');
+  ctx.fillStyle = hg2; ctx.fillRect(-32, -215, 64, 42);
+  ctx.restore();
+  ctx.restore();
+  ctx.restore();
+  ctx.restore();
+}
+function doubaoHeadBack(o) {
+  const hy = -184;
+  sE2(-25.5, hy + 4, 5, 7.5, C.skinHi, C.skinMid, C.skinLo);
+  sE2(25.5, hy + 4, 5, 7.5, C.skinHi, C.skinMid, C.skinLo);
+  fE(0, hy + 30, 8.5, 8, C.skinSh);                                  // 后颈（随后被发尾遮住下半）
+  ctx.beginPath();                                                   // 波波头背面：上圆、发尾内收
+  ctx.moveTo(0, hy - 34);
+  ctx.bezierCurveTo(22, hy - 34, 32, hy - 16, 31, hy + 8);
+  ctx.bezierCurveTo(30, hy + 26, 22, hy + 34, 12, hy + 33);
+  ctx.bezierCurveTo(6, hy + 26, -6, hy + 26, -12, hy + 33);
+  ctx.bezierCurveTo(-22, hy + 34, -30, hy + 26, -31, hy + 8);
+  ctx.bezierCurveTo(-32, hy - 16, -22, hy - 34, 0, hy - 34);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(0, hy - 34, 0, hy + 34);
+  g.addColorStop(0, C.hairHi); g.addColorStop(0.5, C.hairMid); g.addColorStop(1, C.hairLo);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.save(); ctx.clip(); ctx.globalAlpha = 0.3;                     // 顶部光泽
+  const hl = ctx.createRadialGradient(-8, hy - 22, 2, -8, hy - 22, 26);
+  hl.addColorStop(0, '#E0B587'); hl.addColorStop(1, 'rgba(224,181,135,0)');
+  ctx.fillStyle = hl; ctx.fillRect(-34, hy - 36, 68, 40);
+  ctx.globalAlpha = 0.22; ctx.strokeStyle = '#2E1A0E'; ctx.lineWidth = 1.4;            // 发丝走向
+  for (let i = -3; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(i * 8, hy - 32);
+    ctx.bezierCurveTo(i * 11, hy - 6, i * 9.5, hy + 16, i * 8 + 1, hy + 34); ctx.stroke(); }
+  ctx.restore();
+}
+
+function drawBaby(o) {
+  o = o || {}; const mode = o.mode || 'giggle', ph = o.ph || 0, fly = mode === 'fly';
+  const hy = -54;
+  // 四肢（飞出去时四肢张开）
+  const armA = fly ? -0.9 - Math.sin(ph * 3) * 0.3 : -0.15;
+  const legA = fly ? 0.85 + Math.sin(ph * 3) * 0.25 : 0.1;
+  for (const side of [-1, 1]) {
+    const ax = side * 19, ay = -38, al = 17;
+    const hx = ax + side * Math.cos(armA) * al, hyy = ay + Math.sin(armA) * al * (side > 0 ? -1 : -1) * (fly ? 1 : 0) + (fly ? -Math.sin(armA) * al * 0.6 : 8);
+    cap(ax, ay, hx, fly ? ay - 12 : ay + 10, 9, C.baby);
+    fE(hx, fly ? ay - 13 : ay + 11, 6.2, 6, C.limb);                  // 深灰色小手
+    const lx = side * 11, ly = -16;
+    cap(lx, ly, lx + side * Math.cos(legA) * 15, fly ? ly - 4 : ly + 2, 10, C.baby);
+    fE(lx + side * (fly ? 13 : 6), fly ? ly - 6 : ly + 3, 7.5, 5.5, C.limb);
+  }
+  fE(0, -12, 20, 15, C.diaper); fE(0, -14, 20, 13, '#FFFFFF');        // 白色尿布
+  ctx.save(); ctx.globalAlpha = 0.5; fE(0, -8, 15, 6, C.diaperSh); ctx.restore();
+  fE(0, -32, 21, 23, C.baby); fE(0, -29, 14, 15, C.babyBelly);        // 圆滚滚身体 + 浅米肚皮
+  ctx.save(); ctx.fillStyle = C.baby; fE(0, hy, 26, 25, C.baby); ctx.restore();
+  fE(0, hy, 26.8, 25.8, '#E9B32E'); fE(0, hy, 25, 24, C.baby);        // 大脑袋
+  ctx.lineCap = 'round'; ctx.strokeStyle = '#E7D39A'; ctx.lineWidth = 2; // 稀疏胎毛
+  for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(i * 6, hy - 24); ctx.quadraticCurveTo(i * 7 + 2, hy - 31, i * 5 + 4, hy - 33); ctx.stroke(); }
+  for (const side of [-1, 1]) {                                       // 绿色大眼睛
+    const x = side * 9.5, y = hy + 1;
+    fE(x, y, 7.4, 8, '#F4FFF2'); fE(x + side * 0.5, y + 0.5, 5.2, 5.8, '#3E8E41');
+    fE(x + side * 0.5, y + 1, 2.4, 2.8, '#0E2A12'); fE(x - 1.8, y - 2.4, 2, 2, '#FFFFFF');
+    sE(x, y, 7.4, 8, '#8A7A4A', 1);
+  }
+  fE(0, hy + 9, 4.2, 3.2, '#F3B9AE');                                  // 小鼻子
+  fE(0, hy + 17, 7.5, 7, '#8A3A3A');                                   // 张嘴 + 吐舌头
+  fE(1.5, hy + 22 + (mode === 'cry' ? -3 : 0), 4.6, 6, '#F58C96');
+  if (mode === 'cry') { ctx.fillStyle = '#9FD8F0'; fE(-11, hy + 12, 2.4, 4, '#9FD8F0'); fE(11, hy + 12, 2.4, 4, '#9FD8F0'); }
+}
+
+/* ------------------------- 牛来（障碍物）身高 162 -------------------------
+ * 黄色毛茸茸人形牛：灰色弯牛角、粉色猪鼻、粉色肚皮、粉色两趾手脚、半睁吊梢眼撇嘴
+ * o = { ph 走路相位, hit 被撞飞 }
+ */
+function drawNiulaiFront(o) {
+  o = o || {};
+  const ph = o.ph || 0;
+  const bob = o.still ? 0 : -Math.abs(Math.sin(ph)) * 2.5;
+  ctx.save(); ctx.translate(0, bob);
+  if (o.hit) { ctx.translate(0, -6); ctx.rotate((typeof o.hit === 'number' ? o.hit : 0.6) * 0.7); }
+
+  for (const side of [-1, 1]) {                                       /* 腿：慢悠悠交替，粉色两趾脚 */
+    const p = ph + (side > 0 ? Math.PI : 0);
+    const fx = side * 17 + Math.sin(p) * 8, fy = -4 - Math.max(0, Math.sin(p)) * 5;
+    limb(side * 15, -46, 12, fx, fy + 4, 9, C.cow, C.cowD);
+    ell(fx + side * 1.5, fy, 14.5, 9.5, side * 0.05);
+    const fg = ctx.createRadialGradient(fx - 4, fy - 4, 1, fx, fy, 16);
+    fg.addColorStop(0, '#FFD3DA'); fg.addColorStop(0.6, C.cowPink); fg.addColorStop(1, C.cowPinkD);
+    ctx.fillStyle = fg; ctx.fill();
+    ctx.save(); ctx.globalAlpha = 0.7; ctx.strokeStyle = C.cowPinkD; ctx.lineWidth = 1.8;   // 两趾分缝
+    ctx.beginPath(); ctx.moveTo(fx - 4, fy - 8); ctx.lineTo(fx - 4, fy + 7);
+    ctx.moveTo(fx + 5, fy - 8); ctx.lineTo(fx + 5, fy + 7); ctx.stroke(); ctx.restore();
+  }
+
+  fluffArc(0, -92, 44, 52, 0, TAU, 26, 7, C.cow);                      /* 毛茸茸圆胖身体 */
+  vE(0, -92, 44, 52, '#FFD95E', C.cow, C.cowD);
+  sE2(0, -78, 24, 29, '#FFD3DA', C.cowPink, C.cowPinkD);               /* 粉色肚皮 */
+
+  for (const side of [-1, 1]) {                                        /* 手臂 + 粉色三指手 */
+    const hx = side * 52, hy = -62 + Math.sin(ph + side) * 4;
+    limb(side * 40, -122, 11, (side * 46 + hx) / 2, (-122 + hy) / 2, 8.6, C.cow, C.cowD);
+    limb((side * 46 + hx) / 2, (-122 + hy) / 2, 8.6, hx, hy, 7, C.cowD, '#D89A12');
+    ell(hx + side * 1.5, hy + 4, 10, 9.5);
+    ctx.fillStyle = C.cowPink; ctx.fill();
+    for (let i = -1; i <= 1; i++) { ell(hx + i * 5.4 + side * 2, hy + 11, 2.9, 3.8, i * 0.15); ctx.fillStyle = C.cowPinkD; ctx.fill(); }
+  }
+
+  const hy = -146;                                                     /* 头（与身体连成一体） */
+  fluffArc(0, hy, 40, 38, 0, TAU, 22, 6.5, C.cow);
+  sE2(0, hy, 40, 38, '#FFD95E', C.cow, C.cowD);
+  for (const side of [-1, 1]) {                                        /* 耳朵 */
+    ell(side * 44, hy + 1, 13, 8, side * 0.42); ctx.fillStyle = C.cow; ctx.fill();
+    ell(side * 45, hy + 1.5, 8, 4.8, side * 0.42); ctx.fillStyle = C.cowPink; ctx.fill();
+  }
+  for (const side of [-1, 1]) {                                        /* 灰色弯牛角：向上向外 */
+    for (const pass of [0, 1]) {
+      ctx.strokeStyle = pass ? C.horn : C.hornD; ctx.lineWidth = pass ? 8.5 : 12; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(side * 25, hy - 27);
+      ctx.quadraticCurveTo(side * 47, hy - 40, side * 50, hy - 62); ctx.stroke();
+    }
+    ctx.save(); ctx.globalAlpha = 0.35; fE(side * 30, hy - 34, 6, 3.2, '#FFFFFF', side * 0.7); ctx.restore();
+  }
+  sE2(0, hy + 16, 30, 22, '#FFD8DE', C.cowPink, '#EFA0AE');             /* 粉色大猪鼻 */
+  for (const side of [-1, 1]) sE2(side * 10, hy + 12, 4.6, 6.2, '#D98D9C', '#C97C8C', '#A85E6C');
+  ctx.strokeStyle = '#C97C8C'; ctx.lineWidth = 2.6; ctx.lineCap = 'round';   /* 嘴角一撇 */
+  ctx.beginPath(); ctx.moveTo(-13, hy + 27); ctx.quadraticCurveTo(3, hy + 32, 14, hy + 25); ctx.stroke();
+  for (const side of [-1, 1]) {                                        /* 半睁吊梢眼 */
+    const x = side * 15, y = hy - 9;
+    ctx.save(); ctx.beginPath(); ctx.rect(x - 11, y - 2.5, 22, 13); ctx.clip();
+    ell(x, y + 3, 10, 8); ctx.fillStyle = '#FFFFFF'; ctx.fill();
+    sE2(x + side * 2.5, y + 3.5, 5, 5.4, '#8A5A2A', '#5C3616', '#3A2008');
+    fE(x + side * 1, y + 1, 1.6, 1.6, 'rgba(255,255,255,.85)');
+    ctx.restore();
+    ell(x, y - 3.5, 10.8, 5.6); ctx.fillStyle = C.cow; ctx.fill();     // 下垂的眼皮
+    ctx.save(); ctx.globalAlpha = 0.5; sE(x, y + 3, 10, 6.4, '#B07E12', 1.2); ctx.restore();
+    ctx.strokeStyle = '#8A5A12'; ctx.lineWidth = 3.4; ctx.lineCap = 'round';   // 眉毛
+    ctx.beginPath(); ctx.moveTo(x - 10, y - 9 + side * 1.6); ctx.lineTo(x + 10, y - 12 - side * 1.6); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawNiulai(o) { o = o || {}; return o.back ? drawNiulaiBack(o) : drawNiulaiFront(o); }
+
+/* 牛来（背面 3/4）：毛茸茸后背、粉色屁股、两只弯牛角向上外张、脸侧转露出猪鼻和吊梢眼 */
+function drawNiulaiBack(o) {
+  o = o || {};
+  const ph = o.ph || 0, bob = o.still ? 0 : -Math.abs(Math.sin(ph)) * 2.5;
+  ctx.save(); ctx.translate(0, bob);
+  if (o.hit) { ctx.translate(0, -6); ctx.rotate((typeof o.hit === 'number' ? o.hit : 0.6) * 0.8); }
+  for (const side of [-1, 1]) {                                       // 腿：交替抬起
+    const p = ph + (side > 0 ? Math.PI : 0), lift = Math.max(0, Math.sin(p));
+    const fx = side * 17, fy = -4 - lift * 12;
+    cap(side * 15, -46 + bob, fx, fy, 22, side > 0 ? C.cow : C.cowD);
+    fE(fx, fy, 15, 9.5, C.cowPink);
+    if (lift > 0.35) fE(fx, fy + 2, 10, 5.5, '#E3AEB6');              // 抬起露出脚底
+    line([[fx - 1, fy - 6], [fx - 1, fy + 7]], C.cowPinkD, 2);
+  }
+  sE2(0, -30 + bob, 15, 9, '#FDE2E6', C.cowPink, C.cowPinkD);                                 // 尾巴根 / 屁股
+  ctx.save(); ctx.strokeStyle = C.cowD; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(0, -34 + bob);
+  ctx.quadraticCurveTo(7, -22 + bob, 3 + Math.sin(ph * 1.6) * 9, -12 + bob); ctx.stroke(); ctx.restore();
+  fluffArc(0, -92 + bob, 45, 53, 0, TAU, 26, 7, C.cow);               // 毛茸茸后背
+  vE(0, -92 + bob, 43, 51, '#FFD755', C.cow, C.cowD);
+  ctx.save(); ctx.globalAlpha = 0.18; fE(-14, -108 + bob, 14, 22, '#FFFFFF', -0.25); ctx.restore();
+  for (const side of [-1, 1]) {                                       // 手臂
+    const p = ph + (side > 0 ? 0 : Math.PI);
+    const hx = side * 53, hy = -70 + Math.cos(p) * 9 + bob;
+    cap(side * 40, -122 + bob, hx, hy, 20, side > 0 ? C.cow : C.cowD);
+    fE(hx + side * 2, hy + 3, 10.5, 9.5, C.cowPink);
+  }
+  const hy = -148 + bob;                                              // 头（侧转，露出左半边脸）
+  ctx.save(); ctx.translate(0, hy); ctx.rotate(-0.16);
+  for (const side of [-1, 1]) {                                       // 灰色弯牛角（背面看向上外张）
+    ctx.strokeStyle = C.hornD; ctx.lineWidth = 12; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(side * 27, 8); ctx.quadraticCurveTo(side * 46, -8, side * 38, -30); ctx.stroke();
+    ctx.strokeStyle = C.horn; ctx.lineWidth = 8.5;
+    ctx.beginPath(); ctx.moveTo(side * 27, 8); ctx.quadraticCurveTo(side * 46, -8, side * 38, -30); ctx.stroke();
+  }
+  fluffArc(0, 0, 41, 39, 0, TAU, 22, 6.5, C.cow);
+  fE(0, 0, 40, 38, C.cow);
+  for (const side of [-1, 1]) { fE(side * 43, 2, 13, 7.5, C.cow, side * 0.35); fE(side * 44, 2, 8, 4.5, C.cowPink, side * 0.35); }
+  fE(-33, 12, 20, 17, C.cowPink, 0.25);                               // 侧脸：粉色猪鼻
+  fE(-38, 10, 4, 5.5, '#C98D97'); fE(-30, 15, 3.6, 5, '#C98D97');
+  qcurve(-44, 22, -34, 26, -24, 21, '#C98D97', 2.6);                  // 撇嘴
+  ctx.save(); ctx.beginPath(); ctx.rect(-26, -8, 20, 14); ctx.clip();  // 半睁的左眼
+  fE(-17, 1, 9.5, 8, '#FFFFFF'); fE(-19, 2, 4.6, 5, '#4A2E1E'); ctx.restore();
+  fE(-17, -5, 10, 5, C.cow);
+  sE(-17, 1, 9.5, 6.5, '#B98A2A', 1.2);
+  line([[-26, -12], [-10, -15]], '#8A5E18', 3.4);
+  ctx.restore();
+  ctx.restore();
+}
+
+/* ------------------------ 肥嘟嘟（障碍物）身高 132 ------------------------
+ * 黄色圆胖袋鼠：长耳朵一高一低、棕色大鼻子、白色大圆眼、浅黄肚皮、小短手放肚子上、身后有尾巴
+ * o = { ph, hop 跳跃量(0..1), still }
+ */
+function drawFeidudu(o) {
+  o = o || {};
+  const ph = o.ph || 0, hop = o.hop || 0;
+  const sq = 1 - hop * 0.14;
+  ctx.save(); ctx.translate(0, -hop * 26); ctx.scale(1 / sq, sq);
+  ctx.strokeStyle = C.rooD; ctx.lineWidth = 17; ctx.lineCap = 'round';         // 尾巴
+  ctx.beginPath(); ctx.moveTo(24, -22); ctx.quadraticCurveTo(46, -20, 49, -44 - Math.sin(ph) * 6); ctx.stroke();
+  ctx.strokeStyle = C.roo; ctx.lineWidth = 13;
+  ctx.beginPath(); ctx.moveTo(24, -22); ctx.quadraticCurveTo(46, -20, 49, -44 - Math.sin(ph) * 6); ctx.stroke();
+  for (const side of [-1, 1]) sE2(side * 19, -8, 17, 10, '#FFD95E', side > 0 ? C.roo : C.rooD, C.rooD);
+  vE(0, -52, 40, 46, '#FFD95E', C.roo, C.rooD);                                 // 圆胖身体
+  sE2(0, -44, 29, 34, '#FFFBEA', C.rooBelly, '#F0DFAE');                         // 浅黄大肚皮
+  for (const side of [-1, 1]) {                                                  // 小短手放在肚子两侧
+    limb(side * 30, -74, 8.5, side * 33, -58, 7.5, C.roo, C.rooD);
+    ell(side * 31, -50, 10, 9); ctx.fillStyle = side > 0 ? C.roo : C.rooD; ctx.fill();
+    ctx.save(); ctx.globalAlpha = 0.35; fE(side * 31, -46, 7, 3.4, '#E0A81B'); ctx.restore();
+  }
+  const hy = -98;
+  sE2(0, hy, 27, 25, '#FFD95E', C.roo, C.rooD);                                  // 头
+  sE2(0, hy + 14, 17, 13, '#FFD95E', C.roo, C.rooD);
+  sE2(0, hy + 17, 12.5, 10.5, '#A96B35', C.rooNose, '#5E2E0C');                   // 棕色大鼻子
+  ctx.save(); ctx.globalAlpha = 0.4; fE(-3.4, hy + 13, 4, 2.6, '#FFFFFF', -0.4); ctx.restore();
+  for (const side of [-1, 1]) {                                                   // 长耳朵：左竖直、右微弯
+    ctx.save();
+    ctx.translate(side * 13, hy - 18);
+    ctx.rotate(side > 0 ? 0.62 : -0.05);
+    const len = side > 0 ? 25 : 32;
+    ell(0, -len, 9.5, len); const eg = ctx.createLinearGradient(-9, 0, 9, 0);
+    eg.addColorStop(0, '#FFD95E'); eg.addColorStop(0.5, C.roo); eg.addColorStop(1, C.rooD);
+    ctx.fillStyle = eg; ctx.fill();
+    ell(0, -len + 2, 5, len - 6); ctx.fillStyle = '#F7D98A'; ctx.fill();
+    ctx.restore();
+  }
+  for (const side of [-1, 1]) {                                                   // 白色大圆眼 + 棕瞳
+    const x = side * 12, y = hy - 4;
+    sE2(x, y, 10.5, 11, '#FFFFFF', '#FFFFFF', '#E4D6B8');
+    sE2(x + side * 1.5, y + 1, 5, 5.6, '#8A5A2A', '#5C3616', '#33190A');
+    fE(x + side * 0.4, y - 1.2, 1.9, 1.9, 'rgba(255,255,255,.92)');
+    ctx.save(); ctx.globalAlpha = 0.55; sE(x, y, 10.5, 11, '#D8A93A', 1.3); ctx.restore();
+  }
+  ctx.strokeStyle = '#A8703A'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-7, hy + 27); ctx.quadraticCurveTo(0, hy + 31, 7, hy + 27); ctx.stroke();
+  ctx.restore();
+}/* ======================= 6. 障碍物 / 投掷物 / 道具 ======================= */
+/* 通用：以原点为中心的 44x44 设计盒 */
+function drawItem(kind, t) {
+  t = t || 0;
+  switch (kind) {
+    case 'bottle': case 'glowbottle': {                               // 奶瓶（发光版 = 加分道具）
+      if (kind === 'glowbottle') {
+        const g = 1 + Math.sin(t * 5) * 0.12;
+        ctx.save(); ctx.globalAlpha = 0.30; fE(0, 0, 27 * g, 27 * g, '#FFF6B0'); ctx.restore();
+        ctx.save(); ctx.globalAlpha = 0.50; fE(0, 0, 18 * g, 18 * g, '#FFEFA0'); ctx.restore();
+      }
+      fRR(-9, -12, 18, 26, 8, kind === 'glowbottle' ? '#FFFDF2' : '#F4F6F8');
+      fRR(-8, -2, 16, 15, 6, '#FFF2CC');                              // 奶
+      fRR(-7, -18, 14, 7, 3, '#8FD3E8');                              // 蓝色瓶盖
+      fE(0, -21, 5, 5, '#F6D9B8');                                    // 奶嘴
+      ctx.save(); ctx.globalAlpha = 0.7; fRR(-6, -9, 3.5, 18, 2, '#FFFFFF'); ctx.restore();
+      line([[-8, 1], [8, 1]], '#E2C79A', 1.4);
+      if (kind === 'glowbottle') { star(15, -15, 4.6, 1.8, 4, t * 2, '#FFF6B0'); star(-16, 9, 3.6, 1.4, 4, -t * 2, '#FFF6B0'); }
+      break;
+    }
+    case 'slipper':                                                   // 拖鞋（俯视：鞋底 + Y 形鞋带）
+      ctx.save(); ctx.rotate(-0.38);
+      fE(0, 0, 11.5, 17.5, '#D85A6C'); fE(0, -0.8, 9.6, 15.6, '#F7A0B0');
+      ctx.strokeStyle = '#E4707F'; ctx.lineWidth = 3.8; ctx.lineCap = 'round'; ctx.beginPath();
+      ctx.moveTo(-9.5, -2); ctx.quadraticCurveTo(-2.5, -12, 0, -16);
+      ctx.moveTo(9.5, -2); ctx.quadraticCurveTo(2.5, -12, 0, -16);
+      ctx.moveTo(-10, 4); ctx.quadraticCurveTo(0, 10, 10, 4);
+      ctx.stroke(); fE(0, -16, 2.8, 2.8, '#C8485A');
+      ctx.restore();
+      break;
+    case 'plush':                                                     // 毛绒玩具
+      fE(-11, -12, 6, 6, '#A8DCC8'); fE(11, -12, 6, 6, '#A8DCC8');
+      fE(0, 6, 14, 12, '#BEE8D6'); fE(0, -6, 13, 12, '#BEE8D6');
+      fE(-4.5, -8, 3, 3.4, '#3A3A46'); fE(4.5, -8, 3, 3.4, '#3A3A46');
+      fE(0, -2, 3.4, 2.4, '#7FBFA0'); fE(-11, 12, 5.5, 4.5, '#A8DCC8'); fE(11, 12, 5.5, 4.5, '#A8DCC8');
+      break;
+    case 'remote':                                                    // 遥控器
+      fRR(-8, -17, 16, 34, 5, '#4A4A58'); fRR(-6.5, -15, 13, 9, 3, '#2A2A34');
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++)
+        fE(-4 + j * 4, 0 + i * 6, 1.8, 1.8, ['#F49E9E', '#A8D8A8', '#A8C8E8'][j]);
+      break;
+    case 'pan':                                                       // 平底锅（稀有 5%，砸中直接结束）
+      fE(-4, 0, 20, 20, '#2E2E36'); fE(-4, 0, 16.5, 16.5, '#4C4C58'); fE(-4, 0, 12, 12, '#3A3A44');
+      ctx.save(); ctx.globalAlpha = 0.35; fE(-10, -7, 6, 3.5, '#FFFFFF', -0.6); ctx.restore();
+      cap(14, -6, 31, -15, 7, '#20202A'); fE(32, -16, 3.5, 3.5, '#20202A');
+      break;
+    case 'diaper':                                                    // 脏尿布
+      fE(0, -2, 18, 15, '#FFFFFF'); fE(0, 4, 15, 11, '#EFF1F6'); fE(4, 4, 8, 6, '#F2D98A');
+      ctx.save(); ctx.globalAlpha = 0.8; ctx.strokeStyle = '#9CCB7A'; ctx.lineWidth = 2.2;
+      for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(i * 9, -18); ctx.quadraticCurveTo(i * 9 + 5, -25, i * 9, -32); ctx.stroke(); }
+      ctx.restore();
+      break;
+    case 'lollipop': {                                                // 棒棒糖（5 秒无敌）
+      cap(0, 6, 0, 24, 4, '#F0EFEA');
+      const g = ctx.createRadialGradient(0, -6, 2, 0, -6, 16);
+      g.addColorStop(0, '#FFF0F0'); g.addColorStop(1, '#F4646C');
+      ctx.beginPath(); ctx.arc(0, -6, 15, 0, TAU); ctx.fillStyle = g; ctx.fill();
+      ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 3; ctx.beginPath();      // 螺旋纹
+      for (let a = 0; a < TAU * 2.2; a += 0.2) { const r = 1.5 + a * 1.05, x = Math.cos(a + t) * r, y = -6 + Math.sin(a + t) * r; a === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke();
+      break;
+    }
+    case 'walker':                                                    // 学步车（5 秒冲刺）
+      cap(-16, -14, -16, 10, 5, '#8FD3E8'); cap(16, -14, 16, 10, 5, '#8FD3E8');
+      fRR(-18, -22, 36, 10, 5, '#A8E0F0'); fRR(-13, -10, 26, 14, 6, '#F7E6C8');
+      for (const s of [-1, 1]) { fE(s * 16, 13, 6.5, 6.5, '#4A4A58'); fE(s * 16, 13, 2.6, 2.6, '#B8B8C4'); }
+      break;
+    case 'pillow':                                                    // 枕头（护盾，挡一次投掷）
+      ctx.beginPath();
+      ctx.moveTo(-19, -11); ctx.quadraticCurveTo(0, -19, 19, -11);
+      ctx.quadraticCurveTo(25, 0, 19, 11); ctx.quadraticCurveTo(0, 19, -19, 11);
+      ctx.quadraticCurveTo(-25, 0, -19, -11); ctx.closePath();
+      ctx.fillStyle = '#FFFDF6'; ctx.fill(); ctx.strokeStyle = '#F0B8C4'; ctx.lineWidth = 2.5; ctx.stroke();
+      qcurve(-8, -4, 0, 2, 8, -4, '#EEDCC0', 2);
+      break;
+  }
+}
+
+/* 婴儿车：整条轨道挡死，只能换道 */
+function drawStroller(t) {
+  const W1 = '#7EC8E3', W2 = '#4E93B5';
+  fE(-14, -5, 8, 8, '#3A3A46'); fE(14, -5, 8, 8, '#3A3A46');          // 轮子
+  fE(-14, -5, 3.4, 3.4, '#9A9AA8'); fE(14, -5, 3.4, 3.4, '#9A9AA8');
+  cap(-14, -8, 14, -10, 4, '#8A8A98');
+  ctx.save(); ctx.translate(0, -44);
+  ctx.beginPath(); ctx.moveTo(-19, 6); ctx.quadraticCurveTo(-18, -26, 1, -28);
+  ctx.quadraticCurveTo(19, -28, 19, 6); ctx.closePath();
+  ctx.fillStyle = W1; ctx.fill();
+  ctx.save(); ctx.clip(); ctx.strokeStyle = W2; ctx.lineWidth = 2.6;
+  for (let i = -16; i < 20; i += 7.5) { ctx.beginPath(); ctx.moveTo(i, -30); ctx.lineTo(i + 7, 8); ctx.stroke(); }
+  ctx.restore(); ctx.restore();
+  fRR(-21, -44, 42, 15, 7, W2); fRR(-18, -42, 36, 7, 3.5, '#F7E6C8');  // 车沿 + 毯子
+  cap(-19, -40, -23, -62, 5, '#8A8A98'); fE(-24, -64, 4, 3.4, '#6A6A78'); // 收短的推把
+  fE(2, -56, 8, 7.4, '#FFD9A8');                                       // 车里的小脑袋
+  fE(0, -57, 2.2, 2.4, '#3A3A46'); fE(5, -57, 2.2, 2.4, '#3A3A46');
+  fE(2, -53.5, 2.6, 1.6, '#F58C96');
+}
+
+/* 积木堆：矮，能跳过去 */
+function drawBlocks(t) {
+  const cols = [['#F49E9E', '#D97C7C'], ['#A8D8A8', '#7FB87F'], ['#A8C8E8', '#7A9EC4'], ['#FFD93D', '#E0B32A']];
+  function b(x, y, s, i, r) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(r);
+    fRR(-s / 2, -s / 2, s, s, 4, cols[i][1]); fRR(-s / 2 + 2, -s / 2 + 2, s - 4, s - 4, 3, cols[i][0]);
+    ctx.globalAlpha = 0.7; ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold ' + (s * 0.52) + 'px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('0123'.charAt(i), 0, 1); ctx.globalAlpha = 1; ctx.restore();
+  }
+  b(-15, -13, 26, 0, -0.05); b(16, -13, 26, 2, 0.07);
+  b(0, -37, 24, 1, 0.02); b(1, -57, 18, 3, -0.12 + Math.sin(t * 2) * 0.04);
+}
+
+/* 晾衣绳：横杆在上、衣服垂到腰，必须滑铲 */
+function drawClothesline(t) {
+  for (const sg of [-1, 1]) { cap(sg * 22, 0, sg * 22, -84, 6, '#C8A882'); fE(sg * 22, -86, 4.4, 4.4, '#B08E68'); }
+  ctx.strokeStyle = '#8A8A98'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-22, -82); ctx.quadraticCurveTo(0, -71, 22, -82); ctx.stroke();
+  const cloth = [[-12, '#F4A8B8', '#D9849A'], [1, '#A8D8F0', '#7FB4D0'], [13, '#C8E8A8', '#9CC47C']];
+  for (const c of cloth) {
+    const x = c[0], y = -74 + Math.abs(x) * 0.05, sw = Math.sin(t * 2 + x) * 0.04;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(sw);
+    fPoly([[-7, 0], [7, 0], [9, 36], [-9, 36]], c[1]);
+    ctx.save(); ctx.globalAlpha = 0.25; fPoly([[-7, 0], [-2, 0], [-4, 36], [-9, 36]], '#FFFFFF'); ctx.restore();
+    fE(-7, 1, 2.6, 2.6, c[2]); fE(7, 1, 2.6, 2.6, c[2]);
+    ctx.restore();
+  }
+}
+
+/* 地面投影 */
+function shadow(x, y, rx, ry, a) { ctx.save(); ctx.globalAlpha = a == null ? 0.16 : a; fE(x, y, rx, ry, '#4A3358'); ctx.restore(); }/* ============================ 7. 背景与跑道 ============================ */
+let SKY = null, GROUND = null;
+function buildGradients() {
+  SKY = ctx.createLinearGradient(0, 0, 0, H * 0.62);                 // 天空：天蓝 -> 奶粉
+  SKY.addColorStop(0, '#7FCDF2'); SKY.addColorStop(0.45, '#BFE6FA'); SKY.addColorStop(1, '#FFE9D8');
+  GROUND = ctx.createLinearGradient(0, H * CFG.HORIZON, 0, H);
+  GROUND.addColorStop(0, '#BEE39F'); GROUND.addColorStop(0.5, '#A8D88A'); GROUND.addColorStop(1, '#96CC7C');
+}
+
+const clouds = [];
+for (let i = 0; i < 7; i++) clouds.push({ x: Math.random(), y: rnd(0.04, 0.26), s: rnd(0.5, 1.15), v: rnd(0.4, 1.4) });
+const houses = [];
+for (let i = 0; i < 14; i++) houses.push({ w: rnd(0.13, 0.22), h: rnd(0.05, 0.10), c: i % 3, roof: chance(0.62) });
+
+function drawSky(t, scrollZ) {
+  const hy = H * CFG.HORIZON;
+  ctx.fillStyle = SKY; ctx.fillRect(0, 0, W, hy + 1);
+  /* ---------- 第一层（最慢）：太阳 + 云 ---------- */
+  const sx = W * 0.76, sy = H * 0.095;
+  ctx.save();
+  ctx.globalAlpha = 0.16; fE(sx, sy, 62, 62, '#FFF6C8');
+  ctx.globalAlpha = 0.30; fE(sx, sy, 42, 42, '#FFF6C8');
+  ctx.globalAlpha = 0.70; fE(sx, sy, 27, 27, '#FFF3B0');
+  ctx.globalAlpha = 1; fE(sx, sy, 20, 20, '#FFFDF0'); ctx.restore();
+  for (const c of clouds) {
+    c.x -= c.v * 0.00010; if (c.x < -0.3) c.x = 1.3;                 // 云：极慢
+    const x = ((c.x * W - scrollZ * 0.006) % (W * 1.6) + W * 1.6) % (W * 1.6) - W * 0.3;
+    const y = c.y * H, k = c.s * (H / 640) * 23;
+    ctx.save(); ctx.globalAlpha = 0.95;
+    for (const o of [[-1.45, 0.18, 0.8], [-0.55, -0.3, 1.05], [0.5, -0.05, 0.95], [1.45, 0.25, 0.65]])
+      fE(x + o[0] * k, y + o[1] * k * 0.5, o[2] * k, o[2] * k * 0.74, '#FFFFFF');
+    fRR(x - k * 1.95, y + k * 0.05, k * 3.9, k * 0.66, k * 0.33, '#FFFFFF');
+    ctx.restore();
+  }
+  /* ---------- 第二层（慢）：远山 ---------- */
+  ctx.fillStyle = '#B6D3E4'; ctx.beginPath(); ctx.moveTo(0, hy);
+  for (let i = 0; i <= 14; i++) {
+    const x = (i / 14) * W, hgt = Math.sin(i * 1.9 + 0.5) * 0.5 + 0.5;
+    ctx.lineTo(x, hy - hgt * H * 0.05 - H * 0.006);
+  }
+  ctx.lineTo(W, hy); ctx.closePath(); ctx.fill();
+  /* ---------- 第三层（中）：房屋剪影，比近处暗、小 ---------- */
+  const step = W * 0.19, base = hy + H * 0.016;
+  let x0 = -((scrollZ * 0.03) % step) - step;
+  for (let i = 0, x = x0; x < W + step; i++, x += step) {
+    const hh = houses[((i % 14) + 14) % 14], w2 = W * hh.w * 0.92, h2 = H * hh.h * 0.92;
+    ctx.save(); ctx.globalAlpha = 0.85;
+    fRR(x, base - h2, w2, h2 + 3, 3, ['#D2AE96', '#C4A08C', '#DCBBA2'][hh.c]);
+    if (hh.roof) fPoly([[x - 4, base - h2 + 1], [x + w2 + 4, base - h2 + 1], [x + w2 / 2, base - h2 - h2 * 0.46]], '#A9614F');
+    ctx.globalAlpha = 0.4;
+    fRR(x + w2 * 0.16, base - h2 * 0.74, w2 * 0.22, h2 * 0.28, 2, '#FFF3C0');
+    fRR(x + w2 * 0.58, base - h2 * 0.74, w2 * 0.22, h2 * 0.28, 2, '#FFF3C0');
+    ctx.restore();
+  }
+  ctx.fillStyle = GROUND; ctx.fillRect(0, hy, W, H - hy + 1);        // 草地
+}
+
+/* 三条轨道的透视跑道 */
+function drawRoad(scrollZ) {
+  const vx = W / 2, vy = H * CFG.HORIZON, sB = scaleAtBottom();
+  /* 路面：一个顶点在消失点的三角形 → 左右两条边天然笔直 */
+  ctx.fillStyle = '#F0E6D2';
+  ctx.beginPath();
+  ctx.moveTo(vx, vy);
+  ctx.lineTo(vx + roadHalf(sB), H);
+  ctx.lineTo(vx - roadHalf(sB), H);
+  ctx.closePath(); ctx.fill();
+  /* 横向纹理带：随速度向后流动，强化速度感 */
+  const TP = 150;
+  for (let i = 0; i < 26; i++) {
+    const z = i * TP - (scrollZ % TP); if (z < -100) continue;
+    const sa = pScale(Math.max(z, -90)), sb = pScale(z + TP * 0.5);
+    if (sa <= 0.02) continue;
+    const yA = pY(sa), yB = pY(sb), hA = roadHalf(sa), hB = roadHalf(sb);
+    ctx.globalAlpha = 0.13 * Math.min(1, sa * 1.8);
+    ctx.beginPath();
+    ctx.moveTo(vx - hA, yA); ctx.lineTo(vx + hA, yA); ctx.lineTo(vx + hB, yB); ctx.lineTo(vx - hB, yB);
+    ctx.closePath(); ctx.fillStyle = i % 2 ? '#E2D4BC' : '#FBF5E8'; ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  /* 左右外边线：白色实线，近处粗 4px、远处细 1px（梯形→依然是直线） */
+  for (const sg of [-1, 1]) {
+    const fA = 0.05, fB = sB;
+    const tA = lerp(1, 4, fA / sB) / 2, tB = lerp(1, 4, fB / sB) / 2;
+    const xa = vx + sg * roadHalf(fA), ya = pY(fA);
+    const xb = vx + sg * roadHalf(fB), yb = pY(fB);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.moveTo(xa - tA, ya); ctx.lineTo(xa + tA, ya); ctx.lineTo(xb + tB, yb); ctx.lineTo(xb - tB, yb);
+    ctx.closePath(); ctx.fill();
+  }
+  /* 两条分道线：路宽 1/3、2/3 处，白色虚线，段长 30·scale、间隔 20·scale */
+  const DASH = 34, GAP = 23, PER = DASH + GAP;
+  for (const u of [-1 / 3, 1 / 3]) {
+    for (let i = -1; i < 46; i++) {
+      const z0 = i * PER - (scrollZ % PER), z1 = z0 + DASH;
+      if (z1 < -80 || z0 > CFG.Z_FAR + 260) continue;
+      const sa = pScale(Math.max(z0, -70)), sb = pScale(z1);
+      if (sa <= 0.03) continue;
+      const yA = pY(sa), yB = pY(sb);
+      const tA = Math.max(0.7, 2.6 * sa), tB = Math.max(0.7, 2.6 * sb);
+      const xa = vx + u * roadHalf(sa), xb = vx + u * roadHalf(sb);
+      ctx.globalAlpha = 0.92 * Math.min(1, sa * 2.6);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.moveTo(xa - tA, yA); ctx.lineTo(xa + tA, yA); ctx.lineTo(xb + tB, yB); ctx.lineTo(xb - tB, yB);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+  /* 地平线雾霭：让远处冒出来的东西有过渡 */
+  const hz = ctx.createLinearGradient(0, vy - H * 0.03, 0, vy + H * 0.07);
+  hz.addColorStop(0, 'rgba(255,246,232,.95)'); hz.addColorStop(1, 'rgba(255,246,232,0)');
+  ctx.fillStyle = hz; ctx.fillRect(0, vy - H * 0.03, W, H * 0.1);
+}
+
+/* 路边景物（树 / 灌木 / 路灯 / 小花），按深度滚动 */
+const SIDE_N = 34, SIDE_STEP = 132, SIDE = [];
+for (let i = 0; i < SIDE_N; i++) SIDE.push({ z: i * SIDE_STEP, side: i % 2 ? 1 : -1, kind: rndI(0, 4), s: rnd(0.82, 1.25) });
+function drawSideProps(scrollZ) {
+  const span = SIDE_N * SIDE_STEP, list = [];
+  for (const p of SIDE) {
+    let z = p.z - (scrollZ % span);
+    while (z < -150) z += span;
+    if (z < CFG.Z_FAR + 400) list.push([z, p]);
+  }
+  list.sort((a, b) => b[0] - a[0]);                                   // 远的先画
+  for (const it of list) {
+    const z = it[0], p = it[1], sc = pScale(z); if (sc <= 0.02) continue;
+    const x = W / 2 + p.side * roadHalf(sc) * (p.kind === 4 ? 2.15 : 1.66);
+    const y = pY(sc), k = sc * (H / 640) * 66 * p.s;
+    const fade = clamp((CFG.Z_FAR + 380 - z) / 300, 0, 1);
+    ctx.save(); ctx.globalAlpha = fade;
+    shadow(x, y, k * 0.46, k * 0.13, 0.13);
+    if (p.kind === 0) {
+      cap(x, y, x, y - k * 1.15, k * 0.17, '#A87F50');
+      cap(x, y - k * 0.8, x - p.side * k * 0.3, y - k * 1.1, k * 0.09, '#A87F50');
+      fE(x, y - k * 1.55, k * 0.58, k * 0.64, '#82C16C'); fE(x - k * 0.4, y - k * 1.28, k * 0.42, k * 0.44, '#98D482');
+      fE(x + k * 0.42, y - k * 1.34, k * 0.4, k * 0.42, '#72B25E'); fE(x, y - k * 2.02, k * 0.36, k * 0.36, '#A6DE8E');
+    } else if (p.kind === 1) {
+      fE(x, y - k * 0.24, k * 0.52, k * 0.32, '#82C16C'); fE(x - k * 0.3, y - k * 0.13, k * 0.34, k * 0.23, '#98D482');
+      fE(x + k * 0.32, y - k * 0.16, k * 0.31, k * 0.21, '#72B25E');
+      fE(x - k * 0.1, y - k * 0.38, k * 0.09, k * 0.09, '#F7A8B8'); fE(x + k * 0.24, y - k * 0.3, k * 0.08, k * 0.08, '#FFE08A');
+    } else if (p.kind === 2) {
+      cap(x, y, x, y - k * 2.25, k * 0.1, '#8E96A4');
+      cap(x, y - k * 2.2, x - p.side * k * 0.44, y - k * 2.36, k * 0.09, '#8E96A4');
+      ctx.save(); ctx.globalAlpha = fade * 0.5; fE(x - p.side * k * 0.48, y - k * 2.32, k * 0.3, k * 0.3, '#FFF3B0'); ctx.restore();
+      fE(x - p.side * k * 0.48, y - k * 2.3, k * 0.17, k * 0.13, '#FFF7D8');
+    } else if (p.kind === 3) {
+      for (let i = 0; i < 3; i++) { const fx = x + (i - 1) * k * 0.26, fy = y - k * (0.16 + i * 0.06);
+        cap(fx, y, fx, fy, k * 0.055, '#72B25E'); fE(fx, fy, k * 0.105, k * 0.105, ['#F7A8B8', '#FFE08A', '#FFFFFF'][i]); }
+    } else {                                                          // 小房子（近景层，按透视排列）
+      const w2 = k * 0.92, h2 = k * 0.74;
+      shadow(x, y, w2 * 0.62, k * 0.11, 0.13);
+      fRR(x - w2 / 2, y - h2, w2, h2, k * 0.08, ['#E8C3A4', '#DDB6A6', '#F0D6BC'][Math.floor(p.z / SIDE_STEP) % 3]);
+      fPoly([[x - w2 / 2 - k * 0.1, y - h2], [x + w2 / 2 + k * 0.1, y - h2], [x, y - h2 - k * 0.62]], '#C4796A');
+      ctx.save(); ctx.globalAlpha = fade * 0.6;
+      fRR(x - w2 * 0.3, y - h2 * 0.78, w2 * 0.24, h2 * 0.26, k * 0.04, '#FFF3C0');
+      fRR(x + w2 * 0.08, y - h2 * 0.78, w2 * 0.24, h2 * 0.26, k * 0.04, '#FFF3C0');
+      fRR(x - w2 * 0.1, y - h2 * 0.4, w2 * 0.2, h2 * 0.4, k * 0.03, '#A9714B'); ctx.restore();
+    }
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}/* ============================ 8. 游戏数据与逻辑 ============================ */
+/* 实体在纵向上的"占位区间"（单位：奶蛙身高的倍数） */
+const BAND = {
+  stroller: [0, 1.02], blocks: [0, 0.46], line: [0.52, 1.75], cow: [0, 0.72], roo: [0, 0.66],
+  thr: [0, 0.32], pan: [0, 0.58], pick: [0, 1.7],
+};
+const DH = { stroller: 78, blocks: 68, line: 90, cow: 206, roo: 132, naiwa: 120, doubao: 214, baby: 82, item: 46 };
+
+const G = {
+  state: 'title', st: 0, t: 0,
+  speed: 0, scrollZ: 0, dist: 0, score: 0, best: 0,
+  lane: 1, laneF: 1, jh: 0, jv: 0, ground: true, coyote: 0, jbuf: 0,
+  slide: 0, runPh: 0,
+  stun: 0, slow: 0, glitch: 0, diaper: 0, babyHead: 0, shield: 0, inv: 0, dash: 0,
+  laugh: 0, laughCd: 0,
+  guilt: 0, dLane: 1, dArm: -1, dMode: 'run', dPh: 0,
+  objs: [], parts: [], pops: [],
+  rowTimer: 0, throwTimer: 0, warn: null,
+  shake: 0, flash: 0, combo: 0, cause: '', hint: 4,
+  deadT: 0, started: false,
+};
+
+try { G.best = parseInt(localStorage.getItem('naiwa_best') || '0', 10) || 0; } catch (e) { }
+function saveBest() { try { if (Math.floor(G.score) > G.best) { G.best = Math.floor(G.score); localStorage.setItem('naiwa_best', String(G.best)); } } catch (e) { } }
+
+const PH = () => H * CFG.P_SIZE;                        // 奶蛙的屏幕身高（所有尺寸的基准）
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+
+/* ---- 粒子 / 飘字 ---- */
+function puff(x, y, n, col, spd, g, r) {
+  for (let i = 0; i < n; i++) G.parts.push({
+    x: x, y: y, vx: rnd(-1, 1) * spd, vy: rnd(-1.4, -0.1) * spd, g: g == null ? 900 : g,
+    life: rnd(0.3, 0.75), max: 0.75, r: r ? rnd(r * 0.6, r * 1.3) : rnd(3, 8) * (H / 640), c: col || '#FFFFFF', star: chance(0.25)
+  });
+}
+function pop(x, y, txt, col) { G.pops.push({ x: x, y: y, txt: txt, col: col || '#FFFFFF', life: 1 }); }
+
+/* ---- 生成障碍 / 道具 ---- */
+const OBS_TYPES = ['stroller', 'blocks', 'blocks', 'line', 'cow', 'roo', 'roo', 'cow', 'stroller', 'line'];
+const EASY_TYPES = ['blocks', 'roo', 'blocks', 'cow', 'roo'];      // 开局只用容易跳/躲的障碍
+function makeObs(lane, type) {
+  return { kind: 'obs', type: type || pick(OBS_TYPES), lane: lane, z: CFG.Z_FAR + rnd(0, 60), ph: rnd(0, TAU), dead: 0, hop: 0, hitT: -1 };
+}
+function makePick(lane) {
+  const r = Math.random();
+  const type = r < 0.44 ? 'glowbottle' : r < 0.64 ? 'lollipop' : r < 0.86 ? 'walker' : 'pillow';
+  return { kind: 'pick', type: type, lane: lane, z: CFG.Z_FAR + rnd(0, 40), ph: rnd(0, TAU), dead: 0 };
+}
+function spawnRow() {                                     // 至少留一条通路：最多同时堵两条轨道
+  const hard = clamp(-0.10 + G.dist / 2600, 0, 0.5);              // 前 ~260m 不会同时堵两条道
+  const n = chance(hard) ? 2 : 1;
+  const lanes = shuffle([0, 1, 2]).slice(0, n);
+  for (const ln of lanes) G.objs.push(makeObs(ln, G.dist < 320 ? pick(EASY_TYPES) : undefined));
+  if (chance(0.42)) {
+    const free = [0, 1, 2].filter(l => lanes.indexOf(l) < 0);
+    if (free.length) G.objs.push(makePick(pick(free)));
+  }
+}
+
+/* ---- 豆姐投掷 ---- */
+const THR_LIST = ['bottle', 'slipper', 'plush', 'remote', 'diaper'];
+function chooseThrow() {
+  if (chance(CFG.BABY_RATE)) return 'baby';
+  if (chance(CFG.PAN_RATE)) return 'pan';
+  return pick(THR_LIST);
+}
+function startThrow() {
+  let lane = chance(0.58) ? G.lane : rndI(0, 2);           // 优先仍玩家所在轨道
+  for (let k = 0; k < 4; k++) {                            // 避开轨道上已有障碍，防止无解
+    const bad = G.objs.some(o => o.kind === 'obs' && !o.dead && o.lane === lane && o.z > 40 && o.z < 780);
+    if (!bad) break;
+    lane = rndI(0, 2);
+  }
+  G.warn = { lane: lane, type: chooseThrow(), t: 0, dur: clamp(1.2 - G.guilt * 0.4, 0.75, 1.2), tz: 640 };
+  G.dMode = 'throw'; G.dArm = 0;
+  Audio.throwS();
+}
+function landThrow(w) {
+  G.objs.push({ kind: 'thr', type: w.type, lane: w.lane, z: w.tz, ph: rnd(0, TAU), dead: 0, land: 1, spin: 0 });
+  const s = pScale(w.tz);
+  puff(pX(w.lane, s), pY(s), 8, '#FFE9C8', 130, 500);
+}
+
+/* ---- 玩家判定区间 ---- */
+function playerBand() { if (G.slide > 0) return [0, 0.46]; return [G.jh, G.jh + 0.98]; }
+function overlap(a, b) { return a[0] < b[1] && a[1] > b[0]; }
+function mistake(v) { G.guilt = clamp(G.guilt + (v || 0.15), 0, 1); G.combo = 0; }/* ============================ 8b. 状态机与更新 ============================ */
+const OBS_NAME = { stroller: '婴儿车', blocks: '积木堆', line: '晾衣绳', cow: '牛来', roo: '肥嘟嘟' };
+const DEAD_T = 0.16;                                        // 被砸中后的残影存活时间
+const THR_NAME = { bottle: '奶瓶', slipper: '拖鞋', plush: '毛绒玩具', remote: '遥控器', pan: '平底锅', diaper: '脏尿布', baby: '小孩' };
+G.iframe = 0;
+
+function resetRun() {
+  G.speed = CFG.V_START; G.scrollZ = 0; G.dist = 0; G.score = 0;
+  G.lane = 1; G.laneF = 1; G.jh = 0; G.jv = 0; G.ground = true; G.coyote = 0; G.jbuf = 0;
+  G.slide = 0; G.stun = 0; G.slow = 0; G.glitch = 0; G.diaper = 0; G.babyHead = 0;
+  G.shield = 0; G.inv = 0; G.dash = 0; G.iframe = 0; G.laugh = 0; G.laughCd = 0;
+  G.guilt = 0.24; G.dLane = 1; G.dArm = -1; G.dMode = 'run';
+  G.objs.length = 0; G.parts.length = 0; G.pops.length = 0;
+  G.rowTimer = 2.3; G.throwTimer = 6.0; G.warn = null;
+  G.shake = 0; G.flash = 0; G.combo = 0; G.hint = 4.5; G.deadT = 0; G.cause = '';
+}
+function goto(s) { G.state = s; G.st = 0; }
+function gameOver(cause) {
+  if (G.state !== 'play') return;
+  G.cause = cause; G.warn = null; goto('over'); G.guilt = 1; G.shake = 16; G.flash = 0.5;
+  Audio.over(); saveBest();
+  puff(pX(G.laneF, 1), H * CFG.BASE_Y, 22, '#FFE9A8', 260, 700);
+}
+
+/* ---- 输入处理 ---- */
+function doJump() {
+  G.jv = CFG.JUMP_V; G.jh = 0.001; G.ground = false; G.slide = 0; G.coyote = 0;
+  Audio.jump(); puff(pX(G.laneF, 1), H * CFG.BASE_Y, 6, '#FFFFFF', 120, 400);
+}
+function handleAction(a) {
+  if (G.state === 'title') { if (a === 'jump') IN.tap = true; return; }
+  if (G.state === 'over') { if (a === 'jump' || a === 'restart') IN.tap = true; return; }
+  if (G.state !== 'play') return;
+  if (a === 'restart') { resetRun(); goto('play'); return; }
+  if (G.stun > 0) return;                                       // 拖鞋：眩晕 1 秒，操作失灵
+  if (a === 'left') { if (G.lane > 0) { G.lane--; Audio.swap(); } }
+  else if (a === 'right') { if (G.lane < 2) { G.lane++; Audio.swap(); } }
+  else if (a === 'jump') { if (G.ground || G.coyote > 0) doJump(); else G.jbuf = 0.13; }
+  else if (a === 'slide') {
+    if (!G.ground) { G.jv = -CFG.JUMP_V * 1.5; }                 // 空中按下 = 快速下坠接滑铲
+    G.slide = CFG.SLIDE_T; Audio.slide();
+    puff(pX(G.laneF, 1), H * CFG.BASE_Y, 5, '#FFFFFF', 100, 300);
+  }
+}
+
+/* ---- 撞击 / 拾取 ---- */
+function smash(o, col) {
+  o.dead = 0.001;
+  const s = pScale(Math.max(o.z, -60));
+  puff(pX(o.lane, s), pY(s) - PH() * s * 0.4, 14, col || '#FFD93D', 300, 900);
+  G.shake = Math.max(G.shake, 7); Audio.smash();
+}
+function hitObstacle(o) {
+  if (G.iframe > 0 || G.inv > 0) { if (G.inv > 0) { smash(o, '#F7A8C8'); G.score += 20; } return; }
+  if (G.dash > 0) { smash(o); G.score += 30; pop(pX(G.laneF, 1), H * 0.40, '撞飞 +30', '#8FD3E8'); return; }
+  if (o.type === 'cow') {                                        // 牛来：被顶飞，减速但不结束
+    smash(o, '#F3C6CC');
+    G.slow = Math.max(G.slow, 1.6); G.iframe = 0.9; mistake(0.2);
+    G.shake = 13; Audio.hit();
+    pop(pX(G.laneF, 1), H * 0.40, '被顶飞！', '#F08080');
+    return;
+  }
+  o.dead = 0.001; smash(o, '#FFD9A8');
+  gameOver('一头撞上' + OBS_NAME[o.type]);
+}
+function hitThrow(o) {
+  if (G.inv > 0) { smash(o, '#F7A8C8'); return; }
+  if (G.shield > 0) {                                            // 枕头护盾：挡一次投掷
+    G.shield = 0; smash(o, '#FFFDF6'); o.dead = 0.001;
+    pop(pX(G.laneF, 1), H * 0.40, '枕头挡下！', '#FFFFFF'); Audio.pick(); return;
+  }
+  if (G.iframe > 0) return;
+  o.dead = 0.001;
+  const px = pX(G.laneF, 1), py = H * 0.43;
+  if (o.type === 'baby') {                                       // 小孩：跳起来接住 = 加分
+    if (G.jh > 0.18) {
+      G.score += 300; G.combo++; G.guilt = clamp(G.guilt - 0.30, 0, 1);
+      pop(px, py - H * 0.03, '接住小孩 +300', '#FFE08A'); Audio.grab();
+      for (let i = 0; i < 26; i++) puff(px, py + 40, 1, ['#FFD93D', '#F7A8B8', '#A8D8F0', '#BEE8A8'][i % 4], 320, 620, 6);
+      G.flash = 0.25; return;
+    }
+    G.babyHead = 3; G.slow = Math.max(G.slow, 3); mistake(0.12); Audio.hit();
+    pop(px, py, '娃挂头上了…', '#FFD93D'); G.shake = 8; return;
+  }
+  mistake(0.14); G.iframe = 0.8; Audio.hit(); G.shake = 9;
+  switch (o.type) {
+    case 'bottle': G.slow = Math.max(G.slow, 2); pop(px, py, '被奶瓶砸中！速度掉了', '#A8D8F0'); break;
+    case 'slipper': G.stun = Math.max(G.stun, 1); pop(px, py, '被拖鞋拍晕！', '#F7A8B8'); break;
+    case 'plush': G.score = Math.max(0, G.score - 100); pop(px, py, '毛绒玩具 -100', '#C8C8D8'); break;
+    case 'remote': G.glitch = Math.max(G.glitch, 1); pop(px, py, '遥控器！屏幕花啦', '#BEE8A8'); break;
+    case 'diaper': G.diaper = Math.max(G.diaper, 3.5); pop(px, py, '好臭的尿布…', '#D8E8B0'); break;
+    case 'pan': gameOver('一记平底锅拍在背上'); break;
+  }
+}
+function grabPickup(o) {
+  o.dead = 0.001; Audio.pick();
+  const px = pX(G.laneF, 1), py = H * 0.40;
+  if (o.type === 'glowbottle') { G.score += 150; pop(px, py, '发光奶瓶 +150', '#FFE08A'); }
+  else if (o.type === 'lollipop') { G.inv = CFG.INV_T; pop(px, py, '棒棒糖：无敌 5 秒！', '#F7A8B8'); }
+  else if (o.type === 'walker') { G.dash = CFG.DASH_T; pop(px, py, '学步车：冲刺 5 秒！', '#8FD3E8'); }
+  else if (o.type === 'pillow') { G.shield = 1; pop(px, py, '枕头：护盾 +1', '#FFFDF6'); }
+  for (let i = 0; i < 12; i++) puff(px, py + 60, 1, '#FFF3B0', 220, 500, 5);
+}
+
+/* ---- 每帧更新 ---- */
+function updatePlay(dt) {
+  // 速度：随里程提升，冲刺/减速会临时改变
+  let target = clamp(CFG.V_START + G.dist * 0.115, CFG.V_START, CFG.V_MAX);
+  if (G.dash > 0) target *= 1.55;
+  if (G.slow > 0 || G.babyHead > 0) target *= 0.62;
+  G.speed = lerp(G.speed, target, clamp(dt * 3.2, 0, 1));
+  G.scrollZ += G.speed * dt;
+  const meters = G.speed * dt / 10;
+  G.dist += meters; G.score += meters * 3.2;
+  G.runPh += dt * (6.5 + G.speed / 90);
+
+  // 横向换道（平滑插值）
+  G.laneF += (G.lane - G.laneF) * clamp(dt / CFG.LANE_T, 0, 1);
+  // 跳跃物理
+  if (!G.ground) {
+    G.jv -= CFG.GRAV * dt; G.jh += G.jv * dt;
+    if (G.jh <= 0) { G.jh = 0; G.jv = 0; G.ground = true; Audio.land(); puff(pX(G.laneF, 1), H * CFG.BASE_Y, 5, '#FFFFFF', 110, 400); }
+  } else G.coyote = 0.09;
+  if (G.jbuf > 0) { G.jbuf -= dt; if (G.ground || G.coyote > 0) { G.jbuf = 0; doJump(); } }
+  if (G.slide > 0) G.slide -= dt;
+  // 状态计时
+  ['stun', 'slow', 'glitch', 'diaper', 'babyHead', 'inv', 'dash', 'coyoteX', 'iframe'].filter(k => k !== 'coyoteX').forEach(k => { if (G[k] > 0) G[k] = Math.max(0, G[k] - dt); });
+  if (G.laugh > 0) G.laugh = Math.max(0, G.laugh - dt);
+  if (G.laughCd > 0) G.laughCd = Math.max(0, G.laughCd - dt);
+  if (G.hint > 0) G.hint -= dt;
+  // 豆姐：怒气随时间消退，追近后跟随玩家轨道
+  G.guilt = clamp(G.guilt - dt * 0.028, 0, 1);
+  G.dLane += (G.laneF - G.dLane) * clamp(dt * 1.7, 0, 1);
+  G.dPh += dt * (7 + G.guilt * 5);
+  if (G.dMode === 'throw') { G.dArm += dt / 0.5; if (G.dArm > 1.3) { G.dArm = -1; G.dMode = 'run'; } }
+  // 投掷节奏
+  if (G.warn) {
+    G.warn.t += dt;
+    if (G.warn.t >= G.warn.dur) { landThrow(G.warn); G.warn = null; }
+  } else {
+    G.throwTimer -= dt;
+    if (G.throwTimer <= 0) {
+      startThrow();
+      const base = lerp(CFG.THROW_MAX, CFG.THROW_MIN, G.guilt);
+      G.throwTimer = base * rnd(0.85, 1.2) * clamp(520 / G.speed, 0.62, 1.25);
+    }
+  }
+  // 障碍生成
+  G.rowTimer -= dt;
+  if (G.rowTimer <= 0) {
+    spawnRow();
+    const ramp = clamp(G.dist / 2600, 0, 1);                        // 前期间距宽、后期变密
+    G.rowTimer = lerp(rnd(820, 1180), rnd(430, 780), ramp) / G.speed;
+  }
+  // 实体推进 + 碰撞
+  const pb = playerBand();
+  for (let i = G.objs.length - 1; i >= 0; i--) {
+    if (G.state !== 'play') break;
+    const o = G.objs[i];
+    if (o.dead > 0) { o.dead += dt; o.z += 420 * dt; if (o.dead > DEAD_T) G.objs.splice(i, 1); continue; }
+    o.z -= G.speed * dt;
+    o.ph += dt * (o.type === 'cow' ? 3.4 : o.type === 'roo' ? 4.2 : 6);
+    if (o.kind === 'obs') {
+      if (o.type === 'cow') o.z += 78 * dt;                      // 牛来慢悠悠向前走
+      if (o.type === 'roo') { o.hop = Math.abs(Math.sin(o.ph * 0.9)); o.z += 46 * dt * o.hop; }
+    }
+    if (o.z < CFG.Z_DEAD) { G.objs.splice(i, 1); continue; }
+    if (o.kind === 'thr' && o.z < -46 && !o.scored) {              // 扔空了 → 奶蛙回头嘲笑
+      o.scored = 1;
+      if (G.laughCd <= 0 && G.state === 'play') { G.laugh = 0.95; G.laughCd = 1.8; Audio.laugh(); }
+    }
+    if (o.kind === 'obs' && o.z < -46 && !o.scored) {              // 同轨道惊险躲过
+      o.scored = 1;
+      if (o.lane === G.lane) { G.combo++; const b = 20 * Math.min(G.combo, 6); G.score += b; pop(pX(G.laneF, 1), H * 0.38, '惊险躲过 +' + b, '#BEE8A8'); }
+    }
+    if (Math.abs(o.z) < 44 && Math.abs(o.lane - G.laneF) < 0.55 && !o.dead) {
+      const band = o.kind === 'pick' ? BAND.pick
+        : o.kind === 'thr' ? (o.type === 'pan' ? BAND.pan : o.type === 'baby' ? [0, 0.75] : BAND.thr)
+        : BAND[o.type];
+      if (o.kind === 'pick') grabPickup(o);
+      else if (overlap(pb, band)) { if (o.kind === 'thr') hitThrow(o); else hitObstacle(o); }
+    }
+  }
+  if (G.guilt >= 1) gameOver('被豆姐揪住了耳朵');
+}/* ============================== 9. 渲染 ============================== */
+function txt(s, x, y, size, color, align, weight, stroke) {
+  ctx.font = (weight || 'bold') + ' ' + size + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  if (stroke) { ctx.lineWidth = size * 0.16; ctx.strokeStyle = stroke; ctx.lineJoin = 'round'; ctx.strokeText(s, x, y); }
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+
+/* 圆润 + 双层描边的标题字（分数用） */
+function txtRound(str, x, y, size, fill, align) {
+  ctx.font = '900 ' + size + 'px "Arial Rounded MT Bold","Hiragino Maru Gothic ProN","YouYuan","幼圆","Microsoft YaHei",sans-serif';
+  ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.lineWidth = size * 0.30; ctx.strokeStyle = 'rgba(92,54,38,.5)'; ctx.strokeText(str, x, y);
+  ctx.lineWidth = size * 0.13; ctx.strokeStyle = '#FFFFFF'; ctx.strokeText(str, x, y);
+  ctx.fillStyle = fill; ctx.fillText(str, x, y);
+}
+
+/* ---- 单个实体 ---- */
+/* 各障碍的设计宽度（含手臂 / 尾巴 / 立柱的最外沿） */
+const DW = { stroller: 50, blocks: 58, line: 46, cow: 128, roo: 100 };
+const LANE_FILL = 0.94;                                              // 最多吃掉所在车道的 94%
+/* 先按高度定缩放，再用"车道限宽"回压，保证任何障碍都不会画到隔壁车道 */
+function fitScale(k, type, sc) {
+  const dw = DW[type]; if (!dw) return k;
+  return Math.min(k, W * CFG.LANE_DX * sc * LANE_FILL / dw);
+}
+
+function drawEntity(o, t) {
+  const sc = pScale(o.z); if (sc <= 0.02) return;
+  const x = pX(o.lane, sc), y = pY(sc);
+  const ph = PH() * sc * 0.9;                              // 该深度下的基准身高（留一点车道间隙）
+  ctx.save();
+  ctx.globalAlpha = clamp((CFG.Z_FAR + 260 - o.z) / 300, 0, 1) * (o.dead > 0 ? clamp(1 - o.dead / DEAD_T, 0, 1) : 1);
+  if (o.kind === 'obs') {
+    shadow(x, y, Math.min(ph * 0.44, W * CFG.LANE_DX * sc * 0.47), ph * 0.13, 0.17);
+    if (o.type === 'cow') { ctx.translate(x, y); const k = fitScale(ph * 0.99 / DH.cow, 'cow', sc); ctx.scale(k, k); drawNiulai({ ph: o.ph }); }
+    else if (o.type === 'roo') { ctx.translate(x, y); const k = fitScale(ph * 0.72 / DH.roo, 'roo', sc); ctx.scale(k, k); drawFeidudu({ ph: o.ph, hop: o.hop }); }
+    else if (o.type === 'stroller') { ctx.translate(x, y); const k = fitScale(ph * 1.02 / DH.stroller, 'stroller', sc); ctx.scale(k, k); drawStroller(t); }
+    else if (o.type === 'blocks') { ctx.translate(x, y); const k = fitScale(ph * 0.46 / DH.blocks, 'blocks', sc); ctx.scale(k, k); drawBlocks(t); }
+    else if (o.type === 'line') { ctx.translate(x, y); const k = fitScale(ph * 0.52 / 38, 'line', sc); ctx.scale(k, k); drawClothesline(t); }
+  } else if (o.kind === 'pick') {
+    const fl = 0.56 + Math.sin(o.ph) * 0.1, cy = y - ph * fl;
+    shadow(x, y, ph * 0.22, ph * 0.07, 0.13);
+    ctx.save(); ctx.globalAlpha *= 0.45; fE(x, y, ph * 0.3, ph * 0.1, '#FFF6B0'); ctx.restore();
+    ctx.translate(x, cy); const k = ph * 0.44 / 44; ctx.scale(k, k);
+    ctx.rotate(Math.sin(o.ph * 0.7) * 0.16);
+    drawItem(o.type, t);
+  } else if (o.kind === 'thr') {
+    if (o.type === 'baby') {
+      shadow(x, y, ph * 0.21, ph * 0.065, 0.13);
+      ctx.translate(x, y); const k = ph * 0.5 / DH.baby; ctx.scale(k, k);
+      drawBaby({ mode: 'giggle', ph: o.ph });
+    } else {
+      const h = (o.type === 'pan' ? 0.56 : 0.32) * ph;
+      shadow(x, y, h * 0.6, h * 0.18, 0.14);
+      ctx.translate(x, y - h * 0.82); const k = h / 44; ctx.scale(k, k);
+      ctx.rotate(Math.sin(o.ph * 0.6) * 0.12);
+      drawItem(o.type, t);
+    }
+  }
+  ctx.restore();
+}
+
+/* ---- 玩家（奶蛙） ---- */
+function drawPlayer(t) {
+  const ph = PH(), x = pX(G.laneF, 1), gy = H * CFG.BASE_Y;
+  const jh = G.jh * ph, y = gy - jh;
+  const lean = clamp((G.lane - G.laneF) * 0.5, -0.4, 0.4);
+  shadow(x, gy + ph * 0.02, ph * 0.36 * (1 - G.jh * 0.45), ph * 0.11 * (1 - G.jh * 0.45), 0.22 - G.jh * 0.1);
+  if (G.dash > 0) {                                                   // 冲刺拖影
+    for (let i = 1; i <= 3; i++) {
+      ctx.save(); ctx.globalAlpha = 0.13 * (4 - i);
+      ctx.translate(x, y + i * ph * 0.06); ctx.scale(ph / DH.naiwa, ph / DH.naiwa);
+      drawNaiwa({ view: 'back', mode: G.slide > 0 ? 'slide' : 'run', ph: G.runPh - i * 0.55 }); ctx.restore();
+    }
+  }
+  ctx.save(); ctx.translate(x, y);
+  if (G.inv > 0) {                                                    // 无敌彩虹光环
+    ctx.save(); ctx.globalAlpha = 0.5 + Math.sin(t * 12) * 0.18;
+    const cc = ['#FF9AA2', '#FFD93D', '#A8E090', '#8FD3E8', '#C7A8F0', '#FFFFFF', '#F7A8B8'];
+    for (let i = 0; i < 7; i++) { const a = t * 3 + i * TAU / 7; fE(Math.cos(a) * ph * 0.46, -ph * 0.55 + Math.sin(a) * ph * 0.52, ph * 0.055, ph * 0.055, cc[i]); }
+    ctx.restore();
+  }
+  let mode = G.slide > 0 ? 'slide' : (!G.ground ? (G.jv > 0 ? 'jump' : 'scared') : 'run');
+  if (G.laugh > 0 && G.ground && G.slide <= 0) mode = 'laugh';
+  const eyes = (G.stun > 0 || G.iframe > 0) ? 'star' : 'normal';
+  const phArg = mode === 'laugh' ? (0.95 - G.laugh) * 30 : G.runPh;
+  ctx.translate(0, -ph * 0.5); ctx.rotate(lean * 0.45); ctx.translate(0, ph * 0.5);
+  ctx.scale(ph / DH.naiwa, ph / DH.naiwa);
+  drawNaiwa({ view: 'back', mode: mode, ph: phArg, eyes: eyes });
+  if (G.dash > 0) { ctx.save(); ctx.translate(0, -30); ctx.scale(1.32, 1.32); drawItem('walker', t); ctx.restore(); }
+  if (G.laugh > 0 && mode === 'laugh') {                              // 嘲笑：飘字 + 声波弧
+    const k = 1 - G.laugh / 0.95, al = Math.min(1, G.laugh / 0.22);
+    ctx.save(); ctx.globalAlpha = al;
+    const ty = -142 - k * 20;
+    txtRound('哈哈哈', 0, ty, 26, '#FFD93D', 'center');
+    for (let i = 0; i < 3; i++) {
+      const aa = -0.85 + i * 0.85;
+      arc(Math.cos(aa) * 40, ty + 16 + Math.sin(aa) * 8, 7 + i * 2.5, Math.PI * 0.12, Math.PI * 0.88, '#FFFFFF', 2.2);
+    }
+    ctx.restore();
+  }
+  if (G.babyHead > 0) {                                               // 小孩骑在头上（脸朝镜头更俏皮）
+    ctx.save(); ctx.translate(0, -104 + Math.sin(t * 9) * 3); ctx.scale(0.5, 0.5);
+    drawBaby({ mode: 'giggle', ph: t * 6 }); ctx.restore();
+  }
+  ctx.restore();
+  if (G.shield > 0) {
+    ctx.save(); ctx.globalAlpha = 0.5 + Math.sin(t * 5) * 0.12;
+    sE(x, y - ph * 0.52, ph * 0.54, ph * 0.66, '#FFFDF6', 3);
+    ctx.globalAlpha = 0.14; fE(x, y - ph * 0.52, ph * 0.54, ph * 0.66, '#FFFFFF'); ctx.restore();
+  }
+  if (G.stun > 0) for (let i = 0; i < 3; i++) { const a = t * 6 + i * TAU / 3; star(x + Math.cos(a) * ph * 0.36, y - ph * 1.06 + Math.sin(a) * ph * 0.11, ph * 0.06, ph * 0.024, 5, a, '#FFE08A'); }
+  if (G.slow > 0 || G.babyHead > 0) { ctx.save(); ctx.globalAlpha = 0.9; fE(x + ph * 0.4, y - ph * 0.95 + Math.sin(t * 8) * 4, ph * 0.035, ph * 0.055, '#9FD8F0'); ctx.restore(); }
+}
+
+/* ---- 豆姐（画面下方逼近的妈妈） ---- */
+function doubaoGeom() {
+  const dist = 1 - clamp(G.guilt, 0, 1);                       // 0 = 贴得很近，1 = 落后很远
+  const k = 1 - dist * 0.5;                                    // 大小 = scale * (1 - distance*0.5)
+  const y = H * CFG.BASE_Y + H * 0.098 + dist * H * 0.13;      // 始终在奶蛙下方 = 在他身后
+  const h = PH() * 1.10 * k;
+  const x = clamp(pX(G.dLane, 1) - W * 0.13, W * 0.15, W * 0.85);
+  return { d: 12, sc: k, x: x, y: y, h: h };
+}
+function drawDoubaoScene(t) {
+  const g = doubaoGeom();
+  shadow(g.x, g.y + g.h * 0.01, g.h * (0.30 - Math.abs(Math.sin(G.dPh)) * 0.02), g.h * 0.08, 0.16);
+  ctx.save(); ctx.translate(g.x, g.y); ctx.scale(g.h / DH.doubao, g.h / DH.doubao);
+  drawDoubaoChar({
+    view: 'back', mode: 'run', ph: G.dPh, pump: 0.75 + G.guilt * 0.7,
+    throwArm: !!G.warn, held: G.warn ? G.warn.type : null, arm: G.dArm,
+  });
+  ctx.restore();
+  if (G.guilt > 0.45) {                                               // 追上来了：怒气符号 + 火苗
+    const ang = clamp((G.guilt - 0.45) * 5, 0, 3) | 0;
+    for (let i = 0; i < ang; i++) angerMark(g.x + (i - 1) * g.h * 0.3, g.y - g.h * 1.02, g.h * 0.15, t + i);
+    if (G.guilt > 0.72) flamePuff(g.x + g.h * 0.34, g.y - g.h * 0.6, g.h * 0.2, t + 1.1);
+  }
+  if (G.state === 'play') {                                           // 脚下扬尘
+    if (chance(0.22)) puff(g.x + rnd(-g.h * 0.2, g.h * 0.2), g.y, 1, 'rgba(255,240,220,.7)', 40, 60, g.h * 0.05);
+  }
+}
+
+
+/* ---- 投掷预警 & 飞行物 ---- */
+function drawWarn(t, layer) {
+  if (!G.warn) return;
+  const w = G.warn, sT = pScale(w.tz), xT = pX(w.lane, sT), yT = pY(sT);
+  const k = clamp(w.t / w.dur, 0, 1), pulse = 0.6 + Math.sin(t * 16) * 0.4;
+  if (layer === 'ground') {                                           // 落点警示圈
+    ctx.save();
+    ctx.globalAlpha = 0.35 + pulse * 0.4;
+    ctx.strokeStyle = '#FF6B6B'; ctx.lineWidth = 3.4; ctx.setLineDash([9, 7]); ctx.lineDashOffset = -t * 40;
+    ctx.beginPath(); ctx.ellipse(xT, yT, PH() * sT * 0.5, PH() * sT * 0.16, 0, 0, TAU); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.2 + pulse * 0.14; ctx.fillStyle = '#FF6B6B';
+    ctx.beginPath(); ctx.ellipse(xT, yT, PH() * sT * 0.48, PH() * sT * 0.15, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+    return;
+  }
+  /* --- 空中：落点上方悬浮提示 + 从豆姐手里甩出去的抛物线 --- */
+  const iy = yT - PH() * sT * (2.0 - k * 0.5);
+  ctx.save(); ctx.globalAlpha = 0.95; ctx.translate(xT, iy);
+  const ik = PH() * sT * 0.36 / 44; ctx.scale(ik, ik);
+  if (w.type === 'baby') { ctx.scale(44 / DH.baby * 1.15, 44 / DH.baby * 1.15); drawBaby({ mode: 'cry', ph: t * 5 }); }
+  else drawItem(w.type, t);
+  ctx.restore();
+  ctx.save(); ctx.globalAlpha = 0.9;
+  arc(xT, iy, PH() * sT * 0.36, -Math.PI / 2, -Math.PI / 2 + TAU * (1 - k), '#FFFFFF', 3);
+  ctx.restore();
+  txt('!', xT, iy - PH() * sT * 0.62, PH() * sT * 0.55, '#FF6B6B', 'center', 'bold', '#FFFFFF');
+  const fp = clamp((w.t - w.dur * 0.5) / (w.dur * 0.5), 0, 1);
+  if (fp > 0 && fp < 1) {
+    const g = doubaoGeom();
+    const x0 = g.x + g.h * 0.1, y0 = g.y - g.h * 0.9;
+    const px = lerp(x0, xT, easeOut(fp)), py = lerp(y0, yT - PH() * sT * 0.2, fp) - Math.sin(fp * Math.PI) * H * 0.11;
+    const sc = lerp(g.sc, sT, fp) * PH() * 0.4 / 44;
+    ctx.save(); ctx.translate(px, py); ctx.rotate(fp * 10); ctx.scale(sc, sc);
+    if (w.type === 'baby') { ctx.scale(44 / DH.baby * 1.5, 44 / DH.baby * 1.5); drawBaby({ mode: 'fly', ph: fp * 6 }); }
+    else drawItem(w.type, t);
+    ctx.restore();
+  }
+}/* ---- 粒子 / 飘字 ---- */
+function drawParticles(dt) {
+  for (let i = G.parts.length - 1; i >= 0; i--) {
+    const p = G.parts[i];
+    p.life -= dt; if (p.life <= 0) { G.parts.splice(i, 1); continue; }
+    p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    ctx.save(); ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    if (p.star) star(p.x, p.y, p.r * 1.6, p.r * 0.6, 5, p.life * 8, p.c);
+    else fE(p.x, p.y, p.r, p.r, p.c);
+    ctx.restore();
+  }
+}
+function drawPops(dt) {
+  for (let i = G.pops.length - 1; i >= 0; i--) {
+    const p = G.pops[i];
+    p.life -= dt * 1.15; if (p.life <= 0) { G.pops.splice(i, 1); continue; }
+    p.y -= dt * 46;
+    ctx.save(); ctx.globalAlpha = clamp(p.life * 1.6, 0, 1);
+    const k = 1 + (1 - clamp(p.life, 0, 1)) * 0.15;
+    txt(p.txt, p.x, p.y, H * 0.030 * k, p.col, 'center', 'bold', 'rgba(70,45,35,.75)');
+    ctx.restore();
+  }
+}
+
+/* ---- 全屏特效 ---- */
+function drawFx(t) {
+  // 冲刺速度线
+  if (G.dash > 0) {
+    ctx.save(); ctx.globalAlpha = 0.35; ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 2;
+    for (let i = 0; i < 14; i++) { const a = (i / 14) * TAU + t * 2, r0 = W * 0.30 + ((t * 900 + i * 137) % (W * 0.5));
+      ctx.beginPath(); ctx.moveTo(W / 2 + Math.cos(a) * r0, H * 0.55 + Math.sin(a) * r0 * 1.1);
+      ctx.lineTo(W / 2 + Math.cos(a) * (r0 + 40), H * 0.55 + Math.sin(a) * (r0 + 40) * 1.1); ctx.stroke(); }
+    ctx.restore();
+  }
+  // 脏尿布：视野被遮挡一片
+  if (G.diaper > 0) {
+    const a = clamp(G.diaper / 0.7, 0, 1);
+    ctx.save(); ctx.globalAlpha = a;
+    ctx.translate(W * 0.36, H * 0.72); ctx.rotate(-0.28);
+    const k = H * 0.0016; ctx.scale(k, k);
+    ctx.beginPath(); ctx.moveTo(-160, -110); ctx.quadraticCurveTo(0, -175, 160, -110);
+    ctx.quadraticCurveTo(215, 20, 150, 150); ctx.quadraticCurveTo(0, 215, -150, 150);
+    ctx.quadraticCurveTo(-215, 20, -160, -110); ctx.closePath();
+    ctx.fillStyle = '#FFFDF6'; ctx.fill(); ctx.strokeStyle = '#E8D9C0'; ctx.lineWidth = 6; ctx.stroke();
+    ctx.globalAlpha = a * 0.85; fE(40, 40, 70, 52, '#F2D98A');
+    ctx.globalAlpha = a; ctx.strokeStyle = '#9CCB7A'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+    for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(i * 70, -140); ctx.quadraticCurveTo(i * 70 + 40, -200, i * 70, -258); ctx.stroke(); }
+    ctx.restore();
+    txt('好臭…', W * 0.36, H * 0.70, H * 0.028, 'rgba(120,110,60,.8)', 'center', 'bold');
+  }
+  // 暗角
+  const vg = ctx.createRadialGradient(W / 2, H * 0.55, H * 0.30, W / 2, H * 0.55, H * 0.78);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(60,30,50,' + (0.16 + G.guilt * 0.16) + ')');
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+  // 白闪
+  if (G.flash > 0) { ctx.save(); ctx.globalAlpha = clamp(G.flash, 0, 1); ctx.fillStyle = '#FFFFFF'; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+  // 花屏（遥控器）
+  if (G.glitch > 0) {
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0);
+    for (let i = 0; i < 8; i++) {
+      const hh = rnd(8, 34) * DPR, yy = rnd(0, Math.max(1, cv.height - hh));
+      ctx.drawImage(cv, 0, yy, cv.width, hh, rnd(-50, 50) * DPR, yy, cv.width, hh);
+    }
+    for (let i = 0; i < 10; i++) { ctx.globalAlpha = rnd(0.06, 0.2); ctx.fillStyle = pick(['#FF6B6B', '#8FD6F5', '#BEE8A8', '#FFFFFF']); ctx.fillRect(0, rnd(0, cv.height), cv.width, rnd(2, 12) * DPR); }
+    ctx.restore();
+  }
+}
+
+/* ---- HUD ---- */
+function drawHUD(t) {
+  const pad = W * 0.05;
+  /* ---- 左上：分数 / 里程 / 速度 ---- */
+  const panelH = H * 0.092;
+  ctx.save(); ctx.globalAlpha = 0.26; fRR(pad - 12, pad - 14, W * 0.5, panelH, 20, '#FFFFFF'); ctx.restore();
+  txtRound(Math.floor(G.score).toLocaleString('en-US'), pad, pad + H * 0.014, H * 0.046, '#FFD93D', 'left');
+  txt(Math.floor(G.dist) + ' m', pad + 2, pad + H * 0.062, H * 0.021, '#FFFFFF', 'left', 'bold', 'rgba(92,54,38,.55)');
+  txt((G.speed / 30).toFixed(1) + ' km/h', pad + W * 0.2, pad + H * 0.062, H * 0.021, '#FFF6E0', 'left', 'bold', 'rgba(92,54,38,.45)');
+  /* ---- 分数下方：一排小圆道具状态 ---- */
+  const buffs = [];
+  if (G.inv > 0) buffs.push({ k: 'lollipop', n: '无敌', p: G.inv / CFG.INV_T, c: '#F7A8B8' });
+  if (G.dash > 0) buffs.push({ k: 'walker', n: '冲刺', p: G.dash / CFG.DASH_T, c: '#8FD3E8' });
+  if (G.shield > 0) buffs.push({ k: 'pillow', n: '护盾', p: 1, c: '#FFFDF6' });
+  if (G.babyHead > 0) buffs.push({ k: 'baby', n: '抱娃', p: G.babyHead / 3, c: '#FFD93D' });
+  if (G.stun > 0) buffs.push({ k: 'slipper', n: '眩晕', p: G.stun, c: '#C8A8F0' });
+  if (G.slow > 0) buffs.push({ k: 'bottle', n: '减速', p: G.slow / 2, c: '#A8C8E8' });
+  const r = H * 0.0165, stepX = r * 3.2;
+  for (let i = 0; i < buffs.length; i++) {
+    const cx = pad + r + i * stepX, cy = pad + panelH + r * 1.95;
+    ctx.save(); ctx.globalAlpha = 0.8; fE(cx, cy, r + 3.5, r + 3.5, '#FFFFFF'); ctx.restore();
+    fE(cx, cy, r + 3.5, r + 3.5, 'rgba(255,255,255,.45)');
+    ctx.save(); ctx.translate(cx, cy); const k = (r * 1.75) / 44; ctx.scale(k, k);
+    if (buffs[i].k === 'baby') drawBaby({ mode: 'giggle', ph: t * 5 }); else drawItem(buffs[i].k, t);
+    ctx.restore();
+    ctx.save(); ctx.strokeStyle = buffs[i].c; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(cx, cy, r + 5.5, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(buffs[i].p, 0, 1)); ctx.stroke(); ctx.restore();
+  }
+  /* ---- 右上：作者署名（小字半透明） ---- */
+  ctx.save(); ctx.globalAlpha = 0.5;
+  txt('作者：汤圆Vision', W - pad, pad - 2, Math.max(10, H * 0.0175), '#7A5540', 'right', '600');
+  ctx.restore();
+  /* ---- 底部：豆姐逼近度 ---- */
+  const bw = W * 0.42, bx = W * 0.53, by = H - pad - H * 0.01;
+  ctx.save(); ctx.globalAlpha = 0.26; fRR(bx - 5, by - 6, bw + 10, 12, 6, '#FFFFFF'); ctx.restore();
+  const gg = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+  gg.addColorStop(0, '#FFD93D'); gg.addColorStop(1, '#E8543F');
+  ctx.fillStyle = gg; rrPath(bx, by - 2, bw * clamp(G.guilt, 0, 1), 4, 2); ctx.fill();
+  txt('豆姐', bx - 11, by, H * 0.016, 'rgba(122,85,64,.85)', 'right', 'bold');
+  if (G.guilt > 0.72 && Math.sin(t * 10) > 0) txt('要被抓到了！', W / 2, by - H * 0.03, H * 0.024, '#E8543F', 'center', 'bold', '#FFFFFF');
+  /* ---- 开场操作提示 ---- */
+  if (G.hint > 0 && G.state === 'play') {
+    ctx.save(); ctx.globalAlpha = clamp(G.hint / 1.2, 0, 1) * 0.92;
+    fRR(W * 0.08, H * 0.36, W * 0.84, H * 0.105, 16, 'rgba(60,40,50,.6)');
+    txt('← → 换道   ↑ 跳   ↓ 滑铲', W / 2, H * 0.40, H * 0.025, '#FFFFFF', 'center');
+    txt('手机上：左右滑 / 上滑 / 下滑', W / 2, H * 0.437, H * 0.02, '#FFE9C8', 'center');
+    ctx.restore();
+  }
+}/* ======================= 10. 开场 / 过场 / 结算 / 主循环 ======================= */
+/* ---- 通用：对话气泡（自动换行） ---- */
+function drawBubble(x, y, w, text, spkX, size) {
+  size = size || H * 0.0195;
+  const F = sz => 'bold ' + sz + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+  const per = Math.max(4, Math.floor((w - size * 3.6) / size / 1.22));   // 每行字数（留安全系数）
+  const noStart = '，。！？…、）》”';                                      // 标点不置于行首
+  const lines = []; let cur = '';
+  for (const ch of text) {
+    if (cur.length >= per && noStart.indexOf(ch) < 0) { lines.push(cur); cur = ch; }
+    else cur += ch;
+  }
+  lines.push(cur);
+  ctx.font = F(size); let mw = 1;                                        // 按实测再收一次字号，保证不出框
+  for (const l of lines) mw = Math.max(mw, ctx.measureText(l).width);
+  const fs2 = mw > w - size * 2.6 ? size * (w - size * 2.6) / mw : size;
+  const lh = fs2 * 1.5, h = lines.length * lh + fs2 * 1.85;
+  ctx.save();
+  ctx.shadowColor = 'rgba(90,50,40,.18)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 4;
+  fRR(x, y, w, h, fs2 * 1.25, '#FFFFFF'); ctx.restore();
+  ctx.beginPath();
+  const tx = clamp(spkX, x + w * 0.22, x + w * 0.78), dir = spkX >= x + w / 2 ? 1 : -1;
+  ctx.moveTo(tx, y + h - 2); ctx.lineTo(tx + dir * fs2 * 1.7, y + h + fs2 * 1.8); ctx.lineTo(tx + dir * fs2 * 0.3, y + h - 2);
+  ctx.closePath(); ctx.fillStyle = '#FFFFFF'; ctx.fill();
+  ctx.font = F(fs2); ctx.fillStyle = '#6B4A3A'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  lines.forEach((ln, i) => ctx.fillText(ln, x + w / 2, y + fs2 * 1.08 + i * lh));
+  return h;
+}
+
+/* ---- 开场：客厅 ---- */
+const LINES = [
+  { who: 'db', t: '孩子哭了你没听见？！奶瓶也不洗！' },
+  { who: 'nw', t: '我刚下班……就玩五分钟……' },
+  { who: 'db', t: '五分钟？两小时了！' },
+];
+function renderTitle(t) {
+  // 墙面 / 地板
+  const g = ctx.createLinearGradient(0, 0, 0, H * 0.62);
+  g.addColorStop(0, '#FBE6D2'); g.addColorStop(1, '#F3D2B6');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H * 0.62);
+  ctx.fillStyle = '#E8C4A4'; ctx.fillRect(0, H * 0.575, W, H * 0.045);
+  ctx.fillStyle = '#D9A87C'; ctx.fillRect(0, H * 0.62, W, H * 0.38);
+  ctx.strokeStyle = 'rgba(160,110,70,.35)'; ctx.lineWidth = 1.5;
+  for (let i = 1; i < 7; i++) { const y = H * 0.62 + i * i * H * 0.008; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  // 窗户
+  const wx = W * 0.055, wy = H * 0.185, ww = W * 0.28, wh = H * 0.145;
+  fRR(wx - 7, wy - 7, ww + 14, wh + 14, 8, '#FFFFFF');
+  const sg = ctx.createLinearGradient(0, wy, 0, wy + wh); sg.addColorStop(0, '#9FDCF7'); sg.addColorStop(1, '#DFF3FF');
+  fRR(wx, wy, ww, wh, 4, sg);
+  ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(wx + ww / 2, wy); ctx.lineTo(wx + ww / 2, wy + wh); ctx.moveTo(wx, wy + wh / 2); ctx.lineTo(wx + ww, wy + wh / 2); ctx.stroke();
+  ctx.save(); ctx.globalAlpha = 0.9; fE(wx + ww * 0.3, wy + wh * 0.28, ww * 0.14, wh * 0.09, '#FFFFFF'); fE(wx + ww * 0.72, wy + wh * 0.62, ww * 0.12, wh * 0.07, '#FFFFFF'); ctx.restore();
+  fRR(wx - W * 0.05, wy - H * 0.012, W * 0.055, wh * 1.15, 6, '#F4A8B8');
+  fRR(wx + ww, wy - H * 0.012, W * 0.055, wh * 1.15, 6, '#F4A8B8');
+  // 挂画 + 时钟
+  fRR(W * 0.44, H * 0.205, W * 0.15, H * 0.08, 4, '#FFF6E0'); ctx.save(); ctx.strokeStyle = '#C8A882'; ctx.lineWidth = 4; ctx.strokeRect(W * 0.44, H * 0.205, W * 0.15, H * 0.08); ctx.restore();
+  fE(W * 0.485, H * 0.25, W * 0.02, H * 0.013, '#BEE8A8'); fE(W * 0.545, H * 0.255, W * 0.022, H * 0.015, '#8FD3E8');
+  fE(W * 0.885, H * 0.235, W * 0.055, W * 0.055, '#FFFFFF'); ctx.strokeStyle = '#C8A882'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(W * 0.885, H * 0.235, W * 0.055, 0, TAU); ctx.stroke();
+  ctx.save(); ctx.translate(W * 0.885, H * 0.235); ctx.rotate(t * 0.6); ctx.strokeStyle = '#7A5540'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -W * 0.038); ctx.stroke(); ctx.rotate(-t * 0.6 + Math.PI * 0.7);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -W * 0.028); ctx.stroke(); ctx.restore();
+  // 沙发
+  const sx = W * 0.06, sy = H * 0.455, sw = W * 0.62, sh = H * 0.195;
+  fRR(sx - W * 0.045, sy - H * 0.02, W * 0.09, sh * 1.1, 14, '#D98C8C');
+  fRR(sx + sw - W * 0.045, sy - H * 0.02, W * 0.09, sh * 1.1, 14, '#D98C8C');
+  fRR(sx, sy, sw, sh * 0.55, 16, '#E8A0A0');
+  fRR(sx, sy + sh * 0.42, sw, sh * 0.5, 14, '#D98C8C');
+  for (let i = 0; i < 3; i++) fRR(sx + sw * (0.04 + i * 0.32), sy + sh * 0.46, sw * 0.29, sh * 0.3, 10, '#EFAAAA');
+  fRR(sx + sw * 0.06, sy + sh * 0.9, W * 0.03, H * 0.03, 4, '#B07A5A');
+  fRR(sx + sw * 0.88, sy + sh * 0.9, W * 0.03, H * 0.03, 4, '#B07A5A');
+  // 地上的奶瓶 / 玩具 / 积木
+  ctx.save(); ctx.translate(W * 0.20, H * 0.815); ctx.rotate(1.4); ctx.scale(H / 640 * 1.5, H / 640 * 1.5); drawItem('bottle', t); ctx.restore();
+  ctx.save(); ctx.translate(W * 0.35, H * 0.86); ctx.scale(H / 640 * 1.7, H / 640 * 1.7); drawItem('plush', t); ctx.restore();
+  ctx.save(); ctx.translate(W * 0.50, H * 0.83); ctx.rotate(-0.3); ctx.scale(H / 640 * 1.4, H / 640 * 1.4); drawItem('remote', t); ctx.restore();
+  fRR(W * 0.615, H * 0.80, W * 0.07, W * 0.07, 6, '#F49E9E'); fRR(W * 0.675, H * 0.845, W * 0.06, W * 0.06, 5, '#A8D8A8');
+  // 婴儿床里哭的小孩
+  fRR(W * 0.775, H * 0.635, W * 0.205, H * 0.145, 10, '#FFF6E0');
+  ctx.save(); ctx.translate(W * 0.872, H * 0.752); ctx.scale(0.86, 0.86); drawBaby({ mode: 'cry', ph: t * 4 }); ctx.restore();
+  ctx.strokeStyle = '#E8CDAE'; ctx.lineWidth = 4;
+  for (let i = 0; i < 7; i++) { const x2 = W * (0.788 + i * 0.027); ctx.beginPath(); ctx.moveTo(x2, H * 0.632); ctx.lineTo(x2, H * 0.782); ctx.stroke(); }
+  fRR(W * 0.772, H * 0.622, W * 0.211, H * 0.016, 6, '#D8B896');
+  qcurve(W * 0.90, H * 0.585, W * 0.94, H * 0.568, W * 0.92, H * 0.548, '#9FD8F0', 3);
+  txt('哇——', W * 0.925, H * 0.528, H * 0.022, '#8AA8C8', 'center');
+  // 奶蛙瘫在沙发上玩手机
+  ctx.save(); ctx.translate(W * 0.34, H * 0.60); ctx.scale(H * 0.185 / DH.naiwa, H * 0.185 / DH.naiwa);
+  drawNaiwa({ mode: 'sit', ph: t * 1.2, eyes: 'shut', hold: 'phone' }); ctx.restore();
+  // 豆姐叉腰冒火
+  ctx.save(); ctx.translate(W * 0.70, H * 0.80); ctx.scale(H * 0.30 / DH.doubao, H * 0.30 / DH.doubao);
+  drawDoubaoChar({ mode: 'stand', ph: t * 2.2, hips: true, face: 'mad' }); ctx.restore();
+  angerMark(W * 0.815, H * 0.455, H * 0.030, t); angerMark(W * 0.615, H * 0.425, H * 0.024, t + 0.7);
+  flamePuff(W * 0.78, H * 0.565, H * 0.030, t);
+  // 标题
+  ctx.save(); ctx.translate(W / 2, H * 0.088 + Math.sin(t * 2) * 4); ctx.rotate(Math.sin(t * 1.4) * 0.02);
+  txt('奶蛙跑酷', 0, 0, H * 0.080, '#FFFFFF', 'center', '900', 'rgba(120,70,50,.35)');
+  txt('奶蛙跑酷', 0, 0, H * 0.080, '#FFD93D', 'center', '900');
+  ctx.restore();
+  txt('被 老 婆 追 着 跑 的 一 天', W / 2, H * 0.140, H * 0.023, '#8A5E44', 'center', 'bold');
+  // 对白（依次出现）
+  const cyc = (t * 0.62) % 3 | 0, lt = (t * 0.62) % 1;
+  const L = LINES[cyc];
+  const bw = W * 0.70;
+  if (L.who === 'db') drawBubble(W * 0.24, H * 0.30, bw, '豆姐：' + L.t, W * 0.70);
+  else drawBubble(W * 0.03, H * 0.30, bw, '奶蛙：' + L.t, W * 0.34);
+  // 开始提示
+  if (Math.sin(t * 4) > -0.35) {
+    fRR(W * 0.16, H * 0.875, W * 0.68, H * 0.055, H * 0.028, 'rgba(255,255,255,.9)');
+    txt('点屏幕 / 按空格 开始逃跑', W / 2, H * 0.9025, H * 0.026, '#C4707A', 'center', 'bold');
+  }
+  txt('← → 换道 · ↑ 跳 · ↓ 滑铲 · 手机滑动操作', W / 2, H * 0.955, H * 0.018, 'rgba(120,80,60,.75)', 'center', '600');
+  watermark();
+}/* ---- 右上角作者署名（小字半透明） ---- */
+function watermark() {
+  ctx.save(); ctx.globalAlpha = 0.5;
+  txt('作者：汤圆Vision', W - W * 0.045, H * 0.021, Math.max(10, H * 0.0175), '#7A5540', 'right', '600');
+  ctx.restore();
+}
+
+/* ---- 2 秒过场：夺门而逃 ---- */
+function renderIntro(t) {
+  const st = G.st, p = clamp(st / 1.55, 0, 1);
+  // 走廊侧视图
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#FBE6D2'); g.addColorStop(1, '#EFC9A6');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#D9A87C'; ctx.fillRect(0, H * 0.74, W, H * 0.26);
+  ctx.strokeStyle = 'rgba(150,100,60,.3)'; ctx.lineWidth = 2;
+  for (let i = 1; i < 6; i++) { ctx.beginPath(); ctx.moveTo(0, H * (0.74 + i * 0.05)); ctx.lineTo(W, H * (0.74 + i * 0.05)); ctx.stroke(); }
+  const off = (st * 300) % (W * 0.44);
+  ctx.fillStyle = 'rgba(170,120,80,.22)'; ctx.fillRect(0, H * 0.335, W, H * 0.011);   // 挂画线
+  for (let i = -2; i < 5; i++) {                                      // 掠过的小相框
+    const x = i * W * 0.44 - off + W * 0.05;
+    fRR(x, H * 0.185, W * 0.14, H * 0.115, 4, 'rgba(170,120,80,.5)');
+    fRR(x + 5, H * 0.192, W * 0.14 - 10, H * 0.101, 3, '#FFF3DC');
+    fE(x + W * 0.07, H * 0.245, W * 0.03, H * 0.024, '#BEE8A8');
+    fE(x + W * 0.045, H * 0.262, W * 0.02, H * 0.016, '#F4A8B8');
+  }
+  fRR(W * 0.80, H * 0.185, W * 0.185, H * 0.56, 8, '#A9714B');        // 尽头的大门（出口）
+  ctx.strokeStyle = '#8A5738'; ctx.lineWidth = 5; rrPath(W * 0.80, H * 0.185, W * 0.185, H * 0.56, 8); ctx.stroke();
+  ctx.save(); ctx.globalAlpha = 0.45;
+  fRR(W * 0.825, H * 0.215, W * 0.135, H * 0.21, 5, '#FFE9A8');
+  fRR(W * 0.825, H * 0.465, W * 0.135, H * 0.21, 5, '#FFE9A8'); ctx.restore();
+  fE(W * 0.818, H * 0.455, 5, 5, '#FFD93D');
+  ctx.save(); ctx.globalAlpha = 0.35; fRR(W * 0.975, H * 0.185, W * 0.03, H * 0.56, 3, '#FFF6C0'); ctx.restore();
+  // 速度线
+  ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = 3;
+  for (let i = 0; i < 12; i++) { const y = H * (0.18 + (i % 6) * 0.11), x = W - ((st * 1400 + i * 173) % (W * 1.3));
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + W * 0.18, y); ctx.stroke(); }
+  // 奶蛙惊慌狂奔
+  const nx = lerp(-W * 0.22, W * 0.56, easeOut(p)), dx = nx - W * 0.40;
+  ctx.save(); ctx.translate(dx, H * 0.745); ctx.scale(H * 0.26 / DH.doubao, H * 0.26 / DH.doubao);
+  drawDoubaoChar({ mode: 'run', ph: t * 15, face: 'mad' }); ctx.restore();
+  shadow(dx, H * 0.748, H * 0.075, H * 0.014, 0.16);
+  ctx.save(); ctx.translate(nx, H * 0.745); ctx.scale(H * 0.20 / DH.naiwa, H * 0.20 / DH.naiwa);
+  drawNaiwa({ mode: 'scared', ph: t * 17, eyes: 'wide' }); ctx.restore();
+  shadow(nx, H * 0.748, H * 0.06, H * 0.012, 0.18);
+  for (let i = 0; i < 4; i++) { const dxx = nx - W * 0.05 - i * W * 0.05; ctx.save(); ctx.globalAlpha = 0.5 - i * 0.1;
+    fE(dxx, H * (0.735 + Math.sin(G.t * 14 + i) * 0.006), W * 0.035, H * 0.010, '#FFFFFF'); ctx.restore(); }
+  txt('老婆！我错了我错了！！！', clamp(nx, W * 0.36, W * 0.64), H * 0.50, H * 0.028, '#FFFFFF', 'center', 'bold', 'rgba(120,70,50,.6)');
+  txt('夺 门 而 逃 ！', W / 2, H * 0.16 + Math.sin(t * 12) * 4, H * 0.062, '#E8543F', 'center', '900', '#FFFFFF');
+  if (st > 1.75) { ctx.save(); ctx.globalAlpha = clamp((st - 1.75) / 0.4, 0, 1); ctx.fillStyle = '#FFFFFF'; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+  watermark();
+}
+
+/* ---- 结算：被抓住了 ---- */
+function drawFallenScene(t) {
+  const gy = H * CFG.BASE_Y, ph = PH();
+  const px = pX(G.laneF, 1) - W * 0.055;
+  const k = H * 0.30 / DH.doubao, gx = px + ph * 1.02, gfeet = gy + ph * 0.05;
+  shadow(px, gy + ph * 0.02, ph * 0.5, ph * 0.12, 0.18);
+  // 奶蛙四脚朝天、眼冒金星
+  ctx.save(); ctx.translate(px - ph * 0.1, gy - ph * 0.14); ctx.rotate(-1.42 + Math.sin(t * 3) * 0.03);
+  ctx.scale(ph / DH.naiwa, ph / DH.naiwa);
+  drawNaiwa({ mode: 'fall', ph: t * 4, eyes: 'star' }); ctx.restore();
+  for (let i = 0; i < 4; i++) { const a = t * 3 + i * TAU / 4; star(px - ph * 0.1 + Math.cos(a) * ph * 0.42, gy - ph * 0.5 + Math.sin(a) * ph * 0.16, ph * 0.055, ph * 0.022, 5, a, '#FFE08A'); }
+  // 豆姐弯腰揪耳朵
+  ctx.save(); ctx.translate(gx, gfeet); ctx.scale(k, k);
+  drawDoubaoChar({ mode: 'stand', ph: t * 2, face: 'mad' }); ctx.restore();
+  const shx = gx - 24 * k, shy = gfeet - 146 * k;
+  cap(shx, shy, px + ph * 0.16, gy - ph * 0.62, 11 * k, C.skin);
+  fE(px + ph * 0.18, gy - ph * 0.66, ph * 0.075, ph * 0.075, C.skin);
+  angerMark(gx + ph * 0.42, gfeet - H * 0.315, H * 0.030, t);
+  flamePuff(gx - ph * 0.5, gfeet - H * 0.20, H * 0.030, t);
+  txt('知道错了没！', clamp(gx, W * 0.2, W * 0.70), gfeet - H * 0.335, H * 0.026, '#FFFFFF', 'center', 'bold', 'rgba(150,60,50,.7)');
+}
+function renderOver(t) {
+  const k = easeOut(clamp((G.deadT - 0.75) / 0.45, 0, 1));
+  if (k <= 0) return;
+  const cw = W * 0.82, ch = H * 0.325, cx = (W - cw) / 2, cy = H * 0.115 + (1 - k) * H * 0.2;
+  ctx.save(); ctx.globalAlpha = k;
+  ctx.shadowColor = 'rgba(80,40,40,.35)'; ctx.shadowBlur = 22; ctx.shadowOffsetY = 10;
+  fRR(cx, cy, cw, ch, 22, '#FFF8EC'); ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = '#E8B93B'; ctx.lineWidth = 4; rrPath(cx, cy, cw, ch, 22); ctx.stroke();
+  // 顶部装饰条
+  ctx.save(); rrPath(cx, cy, cw, ch, 22); ctx.clip(); ctx.fillStyle = '#FFD93D'; ctx.fillRect(cx, cy, cw, H * 0.052); ctx.restore();
+  txt('被 抓 住 了 ！', cx + cw / 2, cy + H * 0.026, H * 0.032, '#8A4A2A', 'center', '900');
+  txt(G.cause, cx + cw / 2, cy + H * 0.075, H * 0.020, '#A8734A', 'center', '600');
+  const rows = [['分数', Math.floor(G.score).toLocaleString('en-US')], ['里程', Math.floor(G.dist) + ' m'], ['最高分', Math.floor(Math.max(G.best, G.score)).toLocaleString('en-US')]];
+  rows.forEach((r, i) => {
+    const y = cy + H * (0.118 + i * 0.040);
+    txt(r[0], cx + cw * 0.14, y, H * 0.022, '#8A6A52', 'left', '600');
+    txt(r[1], cx + cw * 0.86, y, H * 0.026, i === 0 ? '#E8543F' : '#5A4030', 'right', '900');
+  });
+  if (Math.floor(G.score) >= G.best && G.score > 0) txt('新纪录！', cx + cw * 0.5, cy + H * 0.243, H * 0.022, '#E8A93B', 'center', 'bold');
+  if (Math.sin(t * 5) > -0.3) {
+    fRR(cx + cw * 0.18, cy + ch - H * 0.055, cw * 0.64, H * 0.042, H * 0.021, '#FFD93D');
+    txt('再 跑 一 次', cx + cw * 0.5, cy + ch - H * 0.034, H * 0.022, '#7A4A20', 'center', '900');
+  }
+  ctx.restore();
+}
+
+/* ---- 渲染调度 ---- */
+let PDT = 0.016;
+function renderPlay(t) {
+  const hy = H * CFG.HORIZON;
+  const camBob = G.state === 'play' ? Math.sin(G.runPh * 2) * H * 0.0022 : 0;
+  const camRot = G.state === 'play' ? clamp((G.lane - G.laneF) * 0.011, -0.014, 0.014) : 0;
+  ctx.save();
+  if (G.shake > 0) ctx.translate(rnd(-G.shake, G.shake), rnd(-G.shake, G.shake));
+  const camScale = 1.014 + G.shake / 420;                             // 轻微放大，避免镜头运动露出边缘
+  ctx.translate(W / 2, hy); ctx.rotate(camRot); ctx.scale(camScale, camScale); ctx.translate(-W / 2, -hy);
+  ctx.translate(0, camBob);
+  drawSky(t, G.scrollZ);
+  drawRoad(G.scrollZ);
+  drawSideProps(G.scrollZ);
+  drawWarn(t, 'ground');                                              // 地面落点圈贴地，早画
+  const list = G.objs.slice();
+  if (G.state !== 'over') { const g = doubaoGeom(); list.push({ kind: 'doubao', lane: G.dLane, z: g.d, dead: 0 }); }
+  list.sort((a, b) => b.z - a.z);                                     // 由远及近
+  let drew = false;
+  for (const o of list) {
+    if (!drew && o.z < 0 && G.state !== 'over') { drawPlayer(t); drew = true; }
+    if (o.kind === 'doubao') drawDoubaoScene(t);
+    else drawEntity(o, t);
+  }
+  if (!drew && G.state !== 'over') drawPlayer(t);
+  if (G.state === 'over') drawFallenScene(t);
+  drawWarn(t, 'air');
+  drawParticles(PDT); drawPops(PDT);
+  ctx.restore();
+  drawFx(t);
+  if (G.state === 'play') drawHUD(t);
+  else renderOver(t);
+}
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  if (G.state === 'title') renderTitle(G.t);
+  else if (G.state === 'intro') renderIntro(G.t);
+  else renderPlay(G.t);
+  if (G.state !== 'play') watermark();
+}
+
+/* ---- 逻辑调度 ---- */
+function updateOver(dt) {
+  G.deadT += dt;
+  G.speed = lerp(G.speed, 0, clamp(dt * 3.5, 0, 1));
+  G.scrollZ += G.speed * dt;
+  for (let i = G.objs.length - 1; i >= 0; i--) { const o = G.objs[i]; o.z -= G.speed * dt; o.ph += dt * 4; if (o.z < CFG.Z_DEAD) G.objs.splice(i, 1); }
+  G.dLane += (G.laneF - G.dLane) * clamp(dt * 3, 0, 1);
+  G.dPh += dt * 6;
+  if (G.glitch > 0) G.glitch -= dt;
+}
+function update(dt) {
+  G.st += dt;
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 42);
+  if (G.flash > 0) G.flash = Math.max(0, G.flash - dt * 2.4);
+  if (G.state === 'play') updatePlay(dt);
+  else if (G.state === 'intro') { if (G.st > 2.15) { goto('play'); } }
+  else if (G.state === 'over') updateOver(dt);
+}
+function handleTap() {
+  if (G.state === 'title') { resetRun(); goto('intro'); Audio.start(); }
+  else if (G.state === 'over' && G.deadT > 1.4) { resetRun(); goto('play'); Audio.start(); }
+}
+function consumeInput() {
+  const q = IN.queue.slice(); IN.queue.length = 0;
+  for (const a of q) handleAction(a);
+  if (IN.tap) { IN.tap = false; handleTap(); }
+}
+let lastTs = 0;
+function frame(ts) {
+  const dt = Math.min(0.045, Math.max(0.001, (ts - lastTs) / 1000 || 0.016));
+  lastTs = ts; PDT = dt; G.t += dt;
+  consumeInput(); update(dt); render();
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+/* =========================== 全文完 · 作者：汤圆Vision =========================== */
+</script>
+</body>
+</html>
